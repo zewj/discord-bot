@@ -1,0 +1,7 @@
+.env
+*.bak
+__pycache__/
+venv/
+.venv/
+channels.json
+channels.json.bak
