@@ -19,13 +19,13 @@ A Discord bot powered by Claude (claude-sonnet-4-6) with an unhinged, evil, devi
 
 Go to https://console.anthropic.com/ and create an API key.
 
-### 3. (Optional) Get a Tenor API key for reaction GIFs
+### 3. (Optional) Get a Giphy API key for reaction GIFs
 
 If set, the bot can post reaction GIFs of its own via the `send_gif` tool — Claude decides when a GIF fits the moment and the bot uploads it as an attachment. Without this key, the bot is text-only.
 
-1. Go to https://console.cloud.google.com/, create a project, and enable the **Tenor API**
-2. Create an **API key** under Credentials
-3. Set it as `TENOR_API_KEY` (see below)
+1. Go to https://developers.giphy.com/dashboard/ and create an app (pick **API**, not SDK)
+2. Copy the resulting API key
+3. Set it as `GIPHY_API_KEY` (see below)
 
 ### 4. Install and run
 
@@ -37,7 +37,7 @@ pip install -r requirements.txt
 
 $env:DISCORD_TOKEN = "your_discord_bot_token_here"
 $env:ANTHROPIC_API_KEY = "your_anthropic_api_key_here"
-$env:TENOR_API_KEY = "your_tenor_api_key_here"  # optional — enables reaction GIFs
+$env:GIPHY_API_KEY = "your_giphy_api_key_here"  # optional — enables reaction GIFs
 
 python bot.py
 ```
@@ -48,7 +48,7 @@ python bot.py
 - **In DMs**: just message it directly — no mention needed
 - **Auto-reply channel**: run `/setup` in any channel to make the bot reply to every message there (no mention needed)
 - **Images (in)**: attach an image and the bot will see it (vision support)
-- **GIFs (out)**: with `TENOR_API_KEY` set, the bot can post reaction GIFs back via the `send_gif` tool (Claude picks the moment and the search query)
+- **GIFs (out)**: with `GIPHY_API_KEY` set, the bot can post reaction GIFs back via the `send_gif` tool (Claude picks the moment and the search query)
 
 ## Slash commands
 

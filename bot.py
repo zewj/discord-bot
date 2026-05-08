@@ -82,7 +82,7 @@ except ImportError:
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 # Optional. Without it, the send_gif tool is disabled and the bot is text-only.
-TENOR_API_KEY = os.environ.get("TENOR_API_KEY")
+GIPHY_API_KEY = os.environ.get("GIPHY_API_KEY")
 
 # ---------- Config ----------
 
@@ -366,7 +366,7 @@ def cooldown_message(mood: str, name: str) -> str:
     return template.format(name=name, sec=int(USER_RATE_WINDOW))
 
 
-# ---------- GIF tool (Tenor) ----------
+# ---------- GIF tool (Giphy) ----------
 
 GIF_TOOL = {
     "name": "send_gif",
@@ -393,42 +393,45 @@ GIF_TOOL = {
     },
 }
 
-TENOR_SEARCH_URL = "https://tenor.googleapis.com/v2/search"
-TENOR_RESULT_LIMIT = 10
-TENOR_PICK_FROM_TOP = 6
+GIPHY_SEARCH_URL = "https://api.giphy.com/v1/gifs/search"
+GIF_RESULT_LIMIT = 10
+GIF_PICK_FROM_TOP = 6
+GIF_RATING = "pg-13"              # g | pg | pg-13 | r
 GIF_MAX_BYTES = 8 * 1024 * 1024   # stay under Discord's free upload cap
 
 
-async def search_tenor(query: str) -> str | None:
-    if not TENOR_API_KEY:
+async def search_giphy(query: str) -> str | None:
+    if not GIPHY_API_KEY:
         return None
     params = {
+        "api_key": GIPHY_API_KEY,
         "q": query,
-        "key": TENOR_API_KEY,
-        "limit": str(TENOR_RESULT_LIMIT),
-        "media_filter": "gif,mediumgif,tinygif",
-        "contentfilter": "medium",
-        "random": "true",
+        "limit": str(GIF_RESULT_LIMIT),
+        "rating": GIF_RATING,
+        "lang": "en",
+        "bundle": "messaging_non_clips",
     }
     try:
         timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(TENOR_SEARCH_URL, params=params) as resp:
+            async with session.get(GIPHY_SEARCH_URL, params=params) as resp:
                 if resp.status != 200:
-                    print(f"[tenor] search HTTP {resp.status} for query={query!r}")
+                    print(f"[giphy] search HTTP {resp.status} for query={query!r}")
                     return None
                 data = await resp.json()
     except Exception as e:
-        print(f"[tenor] search failed for query={query!r}: {e}")
+        print(f"[giphy] search failed for query={query!r}: {e}")
         return None
 
-    results = data.get("results") or []
+    results = data.get("data") or []
     if not results:
         return None
-    pick = random.choice(results[:TENOR_PICK_FROM_TOP])
-    media = pick.get("media_formats") or {}
-    for fmt in ("gif", "mediumgif", "tinygif"):
-        entry = media.get(fmt) or {}
+    pick = random.choice(results[:GIF_PICK_FROM_TOP])
+    images = pick.get("images") or {}
+    # Prefer size-capped renditions to stay under Discord's upload limit;
+    # fall back to original if Giphy didn't include them.
+    for fmt in ("downsized", "downsized_medium", "fixed_height", "original"):
+        entry = images.get(fmt) or {}
         url = entry.get("url")
         if url:
             return url
@@ -441,15 +444,15 @@ async def fetch_gif_bytes(url: str) -> bytes | None:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
-                    print(f"[tenor] download HTTP {resp.status} for {url}")
+                    print(f"[giphy] download HTTP {resp.status} for {url}")
                     return None
                 data = await resp.read()
                 if len(data) > GIF_MAX_BYTES:
-                    print(f"[tenor] gif too large ({len(data)} bytes): {url}")
+                    print(f"[giphy] gif too large ({len(data)} bytes): {url}")
                     return None
                 return data
     except Exception as e:
-        print(f"[tenor] download failed for {url}: {e}")
+        print(f"[giphy] download failed for {url}: {e}")
         return None
 
 
@@ -746,7 +749,7 @@ async def ask_claude(
         "max_tokens": MAX_TOKENS,
         "system": system_prompt_for(mood, rage_level),
     }
-    if TENOR_API_KEY:
+    if GIPHY_API_KEY:
         api_kwargs["tools"] = [GIF_TOOL]
 
     for attempt in range(2):
@@ -785,7 +788,7 @@ async def ask_claude(
                 if not query:
                     continue
                 gif_queries.append(query)
-                url = await search_tenor(query)
+                url = await search_giphy(query)
                 if not url:
                     print(f"[gif] no result for query={query!r}")
                     continue
