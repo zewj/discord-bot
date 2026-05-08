@@ -12,7 +12,7 @@ A Discord bot powered by Claude (claude-sonnet-4-6) with an unhinged, evil, devi
 4. Under **Privileged Gateway Intents**, enable **MESSAGE CONTENT INTENT**
 5. Go to **OAuth2 → URL Generator**:
    - Scopes: `bot`
-   - Bot Permissions: `Send Messages`, `Read Message History`, `Use External Emojis`
+   - Bot Permissions: `Send Messages`, `Read Message History`, `Use External Emojis`, `Attach Files`, `Embed Links`
 6. Open the generated URL to invite the bot to your server
 
 ### 2. Get an Anthropic API key
