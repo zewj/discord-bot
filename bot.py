@@ -57,13 +57,16 @@ Background:
 """
 
 import asyncio
+import io
 import json
 import os
+import random
 import re
 import time
 from collections import defaultdict, deque
 from pathlib import Path
 
+import aiohttp
 import discord
 from discord import app_commands
 import anthropic
@@ -78,6 +81,8 @@ except ImportError:
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+# Optional. Without it, the send_gif tool is disabled and the bot is text-only.
+TENOR_API_KEY = os.environ.get("TENOR_API_KEY")
 
 # ---------- Config ----------
 
@@ -361,6 +366,93 @@ def cooldown_message(mood: str, name: str) -> str:
     return template.format(name=name, sec=int(USER_RATE_WINDOW))
 
 
+# ---------- GIF tool (Tenor) ----------
+
+GIF_TOOL = {
+    "name": "send_gif",
+    "description": (
+        "Search for and post a single reaction GIF that fits the moment. "
+        "Use SPARINGLY — only when a GIF would punctuate the response in a "
+        "way text can't (dramatic eye-roll after a stupid question, "
+        "mind-blown reaction, facepalm, evil cackle, etc.). Do NOT use it on "
+        "every message; overuse is annoying. The GIF is attached to your "
+        "text reply, so still write a normal response alongside the tool call."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Short, evocative search query, 1-4 words "
+                    "(e.g. 'eye roll', 'mind blown', 'facepalm', 'evil laugh')."
+                ),
+            }
+        },
+        "required": ["query"],
+    },
+}
+
+TENOR_SEARCH_URL = "https://tenor.googleapis.com/v2/search"
+TENOR_RESULT_LIMIT = 10
+TENOR_PICK_FROM_TOP = 6
+GIF_MAX_BYTES = 8 * 1024 * 1024   # stay under Discord's free upload cap
+
+
+async def search_tenor(query: str) -> str | None:
+    if not TENOR_API_KEY:
+        return None
+    params = {
+        "q": query,
+        "key": TENOR_API_KEY,
+        "limit": str(TENOR_RESULT_LIMIT),
+        "media_filter": "gif,mediumgif,tinygif",
+        "contentfilter": "medium",
+        "random": "true",
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(TENOR_SEARCH_URL, params=params) as resp:
+                if resp.status != 200:
+                    print(f"[tenor] search HTTP {resp.status} for query={query!r}")
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        print(f"[tenor] search failed for query={query!r}: {e}")
+        return None
+
+    results = data.get("results") or []
+    if not results:
+        return None
+    pick = random.choice(results[:TENOR_PICK_FROM_TOP])
+    media = pick.get("media_formats") or {}
+    for fmt in ("gif", "mediumgif", "tinygif"):
+        entry = media.get(fmt) or {}
+        url = entry.get("url")
+        if url:
+            return url
+    return None
+
+
+async def fetch_gif_bytes(url: str) -> bytes | None:
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    print(f"[tenor] download HTTP {resp.status} for {url}")
+                    return None
+                data = await resp.read()
+                if len(data) > GIF_MAX_BYTES:
+                    print(f"[tenor] gif too large ({len(data)} bytes): {url}")
+                    return None
+                return data
+    except Exception as e:
+        print(f"[tenor] download failed for {url}: {e}")
+        return None
+
+
 # ---------- Globals ----------
 
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY, max_retries=4)
@@ -641,20 +733,27 @@ async def build_user_content(message: discord.Message, text: str) -> list:
 
 # ---------- Claude call ----------
 
-async def ask_claude(key: str, user_content: list, mood: str, rage_level: float = 0.0) -> str:
+async def ask_claude(
+    key: str, user_content: list, mood: str, rage_level: float = 0.0
+) -> tuple[str, list[bytes]]:
     history[key].append({"role": "user", "content": user_content})
     last_touched[key] = time.time()
     trim_by_count(key)
     trim_by_tokens(key)
 
+    api_kwargs: dict = {
+        "model": MODEL,
+        "max_tokens": MAX_TOKENS,
+        "system": system_prompt_for(mood, rage_level),
+    }
+    if TENOR_API_KEY:
+        api_kwargs["tools"] = [GIF_TOOL]
+
     for attempt in range(2):
         try:
             async with api_semaphore:
                 response = await claude.messages.create(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    system=system_prompt_for(mood, rage_level),
-                    messages=list(history[key]),
+                    messages=list(history[key]), **api_kwargs
                 )
         except anthropic.BadRequestError as e:
             msg = str(e).lower()
@@ -675,16 +774,46 @@ async def ask_claude(key: str, user_content: list, mood: str, rage_level: float 
                 + (getattr(response.usage, "cache_creation_input_tokens", 0) or 0)
             )
 
-        text = "".join(b.text for b in response.content if b.type == "text").strip()
-        history[key].append({"role": "assistant", "content": text})
+        text_parts: list[str] = []
+        gif_queries: list[str] = []
+        gif_blobs: list[bytes] = []
+        for block in response.content:
+            if block.type == "text":
+                text_parts.append(block.text)
+            elif block.type == "tool_use" and block.name == "send_gif":
+                query = ((block.input or {}).get("query") or "").strip()
+                if not query:
+                    continue
+                gif_queries.append(query)
+                url = await search_tenor(query)
+                if not url:
+                    print(f"[gif] no result for query={query!r}")
+                    continue
+                blob = await fetch_gif_bytes(url)
+                if blob:
+                    gif_blobs.append(blob)
+                    print(f"[gif] posting query={query!r} ({len(blob)} bytes)")
+
+        text = "".join(text_parts).strip()
+
+        # Store text-only history (preserves user/assistant alternation across turns).
+        # Note any GIFs inline so Claude sees them in subsequent context.
+        if gif_queries:
+            note = " ".join(f"*[posted GIF: {q}]*" for q in gif_queries)
+            history_text = f"{text}\n\n{note}".strip() if text else note
+        else:
+            history_text = text
+        history[key].append({"role": "assistant", "content": history_text or "(no response)"})
         last_touched[key] = time.time()
 
         if response.stop_reason == "max_tokens" and text:
             text += "\n\n*(...cut off, hit token limit)*"
 
-        return text or "(I got nothing for you)"
+        if not text and not gif_blobs:
+            text = "(I got nothing for you)"
+        return text, gif_blobs
 
-    return "(retry exhausted)"
+    return "(retry exhausted)", []
 
 
 # ---------- Smart chunking ----------
@@ -759,7 +888,7 @@ async def handle_chat(message: discord.Message, content: str):
     typing_ctx = await maybe_typing(message.channel)
     async with typing_ctx:
         try:
-            reply = await ask_claude(key, user_content, mood, rage_level)
+            reply, gif_blobs = await ask_claude(key, user_content, mood, rage_level)
         except anthropic.RateLimitError as e:
             retry_after = "?"
             if e.response is not None:
@@ -789,11 +918,23 @@ async def handle_chat(message: discord.Message, content: str):
             await message.reply(f"Something exploded: {type(e).__name__}: {e}")
             return
 
-    parts = smart_chunk(reply)
+    parts = smart_chunk(reply) if reply else []
+    files = [
+        discord.File(io.BytesIO(blob), filename=f"reaction{i + 1}.gif")
+        for i, blob in enumerate(gif_blobs)
+    ]
     try:
-        await message.reply(parts[0])
-        for part in parts[1:]:
-            await message.channel.send(part)
+        if not parts and not files:
+            await message.reply("(I got nothing for you)")
+        elif not parts:
+            await message.reply(files=files)
+        elif len(parts) == 1:
+            await message.reply(parts[0], files=files)
+        else:
+            await message.reply(parts[0])
+            for part in parts[1:-1]:
+                await message.channel.send(part)
+            await message.channel.send(parts[-1], files=files)
     except discord.HTTPException as e:
         try:
             await message.channel.send(f"Discord choked on the reply: {e}")
