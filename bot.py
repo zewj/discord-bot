@@ -45,10 +45,19 @@ Engagement triggers:
 Slash commands:
   /setup, /unset, /reset, /purge, /mood, /rage, /status
 
-Persistence (channels.json, with channels.json.bak rotation):
-  auto_channels, guild_moods, convo_moods, convo_overrides_touched.
-  History / rage / rate-limit state are all in-memory and reset on restart
-  (deliberate: clean slate).
+Persistence:
+  Settings (channels.json, with .bak rotation):
+    auto_channels, guild_moods, convo_moods, convo_overrides_touched.
+  Conversation memory (memory.json, with .bak rotation, atomic writes):
+    history, rage, last_input_tokens, last_touched.
+  Memory writes are debounced — a background task saves at most every
+  MEMORY_SAVE_INTERVAL seconds when state has changed, plus an atexit
+  handler flushes on shutdown. Image content blocks are stripped at save
+  time (Discord CDN URLs expire ~24h, so persisting them is fragile);
+  the text portion of each turn — including the [DisplayName (id)]:
+  prefix and any "(sent an image)" placeholder — is preserved.
+  Per-user rate-limit buckets are NOT persisted (they're transient
+  spam-prevention state and get reset by the cleanup loop anyway).
 
 Background:
   cleanup_loop runs hourly — drops stale conversations (>48h idle), stale
@@ -57,6 +66,7 @@ Background:
 """
 
 import asyncio
+import atexit
 import io
 import json
 import os
@@ -127,6 +137,11 @@ RAGE_TIER_LABELS = {
 
 CONFIG_PATH = Path(__file__).parent / "channels.json"
 CONFIG_BACKUP_PATH = Path(__file__).parent / "channels.json.bak"
+
+MEMORY_PATH = Path(__file__).parent / "memory.json"
+MEMORY_BACKUP_PATH = Path(__file__).parent / "memory.json.bak"
+MEMORY_TMP_PATH = Path(__file__).parent / "memory.json.tmp"
+MEMORY_SAVE_INTERVAL = 30.0   # seconds — at most one save every N seconds when dirty
 
 # ---------- Personality presets ----------
 
@@ -306,6 +321,7 @@ def update_rage(key: str, user_text: str, prev_user_text: str | None) -> float:
     bump = RAGE_PER_TURN + stupidity_score(user_text, prev_user_text)
     after = max(0.0, min(RAGE_MAX, before + bump))
     rage[key] = after
+    mark_memory_dirty()
 
     # Log only on major threshold crossings (either direction).
     crossed_up = next(
@@ -531,6 +547,193 @@ def save_config():
         print(f"Failed to save config: {e}")
 
 
+# ---------- Conversation-memory persistence ----------
+#
+# Working memory (history / rage / last_input_tokens / last_touched) is the
+# bot's "what we've talked about" state. Without persistence it resets on
+# every restart, so users feel like they're talking to a goldfish. We save it
+# to memory.json:
+#
+#   * Atomic write (tmp file + rename) so a half-written file can't corrupt
+#     the live one.
+#   * Backup rotation (.bak) so a single bad save doesn't wipe everything.
+#   * Debounced — mark dirty on each change, flush at most every
+#     MEMORY_SAVE_INTERVAL seconds via memory_save_loop.
+#   * Image content blocks are stripped on serialize (Discord CDN URLs
+#     expire after ~24h, persisting them is fragile). The text portion of
+#     each turn is preserved verbatim, including any "(sent an image)"
+#     placeholder.
+
+_memory_dirty = False
+_memory_loaded = False
+_memory_save_lock = asyncio.Lock()
+
+
+def mark_memory_dirty() -> None:
+    """Flag that in-memory state has changed; the save loop will flush soon."""
+    global _memory_dirty
+    _memory_dirty = True
+
+
+def _serialize_turn(turn: dict) -> dict | None:
+    """Return a JSON-safe copy of a history turn, dropping image blocks."""
+    if not isinstance(turn, dict):
+        return None
+    role = turn.get("role")
+    content = turn.get("content")
+    if role not in ("user", "assistant"):
+        return None
+
+    if isinstance(content, str):
+        return {"role": role, "content": content}
+
+    if isinstance(content, list):
+        kept: list = []
+        had_image = False
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "image":
+                had_image = True
+                continue
+            if btype == "text":
+                txt = block.get("text", "")
+                if isinstance(txt, str):
+                    kept.append({"type": "text", "text": txt})
+        if not kept:
+            placeholder = "(image only — image not retained across restarts)" if had_image else "(empty)"
+            kept = [{"type": "text", "text": placeholder}]
+        return {"role": role, "content": kept}
+
+    return None
+
+
+def save_memory() -> None:
+    """Synchronous JSON dump of conversation memory. Safe to call from executor."""
+    global _memory_dirty
+    try:
+        history_payload: dict[str, list] = {}
+        for k, dq in history.items():
+            turns = [t for t in (_serialize_turn(t) for t in dq) if t is not None]
+            if turns:
+                history_payload[k] = turns
+
+        payload = {
+            "version": 1,
+            "saved_at": time.time(),
+            "history": history_payload,
+            "rage": {k: float(v) for k, v in rage.items()},
+            "last_input_tokens": {k: int(v) for k, v in last_input_tokens.items()},
+            "last_touched": {k: float(v) for k, v in last_touched.items()},
+        }
+
+        # Atomic write: dump to .tmp, then replace target. If anything fails
+        # mid-dump, the live file stays intact.
+        MEMORY_TMP_PATH.write_text(json.dumps(payload), encoding="utf-8")
+
+        # Rotate backup BEFORE overwriting the live file.
+        if MEMORY_PATH.exists():
+            try:
+                MEMORY_BACKUP_PATH.write_bytes(MEMORY_PATH.read_bytes())
+            except Exception as e:
+                print(f"[memory] backup rotation failed (non-fatal): {e}")
+
+        MEMORY_TMP_PATH.replace(MEMORY_PATH)
+        _memory_dirty = False
+    except Exception as e:
+        print(f"[memory] save failed: {e}")
+        # Best-effort cleanup of the temp file.
+        try:
+            if MEMORY_TMP_PATH.exists():
+                MEMORY_TMP_PATH.unlink()
+        except Exception:
+            pass
+
+
+def load_memory() -> None:
+    """Restore conversation memory from disk. Idempotent — no-op after first load."""
+    global _memory_loaded
+    if _memory_loaded:
+        return
+    _memory_loaded = True
+
+    paths = [p for p in (MEMORY_PATH, MEMORY_BACKUP_PATH) if p.exists()]
+    if not paths:
+        print("[memory] no saved memory found, starting fresh")
+        return
+
+    data = None
+    for p in paths:
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            break
+        except Exception as e:
+            print(f"[memory] failed to load {p.name}: {e}")
+    if data is None:
+        print("[memory] all saved memory files are corrupt — starting fresh")
+        return
+
+    try:
+        loaded_convos = 0
+        for k, turns in (data.get("history") or {}).items():
+            if not isinstance(turns, list):
+                continue
+            dq: deque = deque(maxlen=MAX_TURNS * 2)
+            for turn in turns:
+                clean = _serialize_turn(turn)
+                if clean is not None:
+                    dq.append(clean)
+            # Trim leading assistant messages (Claude requires user-first).
+            while dq and dq[0]["role"] != "user":
+                dq.popleft()
+            if dq:
+                history[k] = dq
+                loaded_convos += 1
+
+        for k, v in (data.get("rage") or {}).items():
+            try:
+                rage[k] = max(0.0, min(RAGE_MAX, float(v)))
+            except (TypeError, ValueError):
+                pass
+
+        for k, v in (data.get("last_input_tokens") or {}).items():
+            try:
+                last_input_tokens[k] = int(v)
+            except (TypeError, ValueError):
+                pass
+
+        for k, v in (data.get("last_touched") or {}).items():
+            try:
+                last_touched[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+
+        saved_at = data.get("saved_at")
+        age = f", age={int(time.time() - saved_at)}s" if isinstance(saved_at, (int, float)) else ""
+        print(
+            f"[memory] loaded {loaded_convos} convos, "
+            f"{len(rage)} rage entries, {len(last_touched)} timestamps{age}"
+        )
+    except Exception as e:
+        print(f"[memory] partial load error: {e}")
+
+
+async def memory_save_loop():
+    """Periodically flush dirty memory to disk in a background task."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            if _memory_dirty:
+                async with _memory_save_lock:
+                    # Run the sync JSON write in a thread so we don't block
+                    # the event loop on large payloads.
+                    await asyncio.get_running_loop().run_in_executor(None, save_memory)
+        except Exception as e:
+            print(f"[memory] save loop error: {e}")
+        await asyncio.sleep(MEMORY_SAVE_INTERVAL)
+
+
 # ---------- Conversation keying ----------
 
 def conversation_key(source: discord.Message | discord.Interaction) -> str:
@@ -632,6 +835,9 @@ async def cleanup_loop():
                 convo_overrides_touched.pop(k, None)
             if stale_overrides:
                 save_config()
+
+            if stale_convos:
+                mark_memory_dirty()
 
             cleanup_runs += 1
             if cleanup_runs % CLEANUP_LOG_EVERY == 0 or stale_convos or stale_users or stale_overrides:
@@ -808,6 +1014,7 @@ async def ask_claude(
             history_text = text
         history[key].append({"role": "assistant", "content": history_text or "(no response)"})
         last_touched[key] = time.time()
+        mark_memory_dirty()
 
         if response.stop_reason == "max_tokens" and text:
             text += "\n\n*(...cut off, hit token limit)*"
@@ -950,6 +1157,7 @@ async def handle_chat(message: discord.Message, content: str):
 @bot.event
 async def on_ready():
     load_config()
+    load_memory()
     try:
         synced = await tree.sync()
         synced_n = len(synced)
@@ -957,6 +1165,7 @@ async def on_ready():
         synced_n = -1
         print(f"Slash command sync failed: {e}")
     bot.loop.create_task(cleanup_loop())
+    bot.loop.create_task(memory_save_loop())
     print("=" * 60)
     print(f"  ONLINE: {bot.user}  (id={bot.user.id})")
     print(f"  model={MODEL}  default_mood={DEFAULT_MOOD}  max_tokens={MAX_TOKENS}")
@@ -966,6 +1175,8 @@ async def on_ready():
           f"guild_moods={len(guild_moods)}  convo_moods={len(convo_moods)}")
     print(f"  rate_limit={USER_RATE_LIMIT}/{int(USER_RATE_WINDOW)}s per user/convo  "
           f"max_concurrent={MAX_CONCURRENT}")
+    print(f"  memory: {len(history)} convos restored, "
+          f"persistence on (every {int(MEMORY_SAVE_INTERVAL)}s)")
     print("=" * 60)
 
 
@@ -1099,6 +1310,7 @@ async def reset_cmd(interaction: discord.Interaction):
     last_input_tokens.pop(key, None)
     last_touched.pop(key, None)
     rage.pop(key, None)
+    mark_memory_dirty()
     await interaction.response.send_message("Memory wiped, patience restored. We're strangers now.")
 
 
@@ -1192,6 +1404,8 @@ async def purge_cmd(
                 user_last_notice.pop(bucket, None)
                 bucket_count += 1
 
+        if wiped:
+            mark_memory_dirty()
         print(
             f"[purge] guild={gid} user={interaction.user} "
             f"wiped_convos={wiped} cleared_buckets={bucket_count} "
@@ -1215,6 +1429,8 @@ async def purge_cmd(
             user_last_touch.pop(bucket, None)
             user_last_notice.pop(bucket, None)
             bucket_count += 1
+    if had:
+        mark_memory_dirty()
     print(
         f"[purge] key={key} user={interaction.user} had_history={had} "
         f"cleared_buckets={bucket_count} "
@@ -1265,6 +1481,7 @@ async def status_cmd(interaction: discord.Interaction):
         f"{rage.get(key, 0.0):.0f}/100 — *{_rage_tier(rage.get(key, 0.0))}* "
         f"(only matters in `escalating` mood)",
         f"**Memory cap:** {MAX_TURNS} turns / {TOKEN_BUDGET:,} tokens / {CONVERSATION_TTL // 3600}h idle",
+        f"**Memory persistence:** on (flushed every {int(MEMORY_SAVE_INTERVAL)}s when changed)",
         f"**Per-user rate limit:** {USER_RATE_LIMIT} msgs / {int(USER_RATE_WINDOW)}s (per conversation)",
         f"**Max concurrent API calls:** {MAX_CONCURRENT}",
         f"**Conversation scope:** `{key}`",
@@ -1280,6 +1497,19 @@ async def status_cmd(interaction: discord.Interaction):
         else:
             lines.append("**Auto-reply channels:** none set")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+def _shutdown_flush():
+    """Best-effort sync save when the process is exiting."""
+    if _memory_dirty:
+        try:
+            save_memory()
+            print("[memory] flushed on shutdown")
+        except Exception as e:
+            print(f"[memory] shutdown flush failed: {e}")
+
+
+atexit.register(_shutdown_flush)
 
 
 if __name__ == "__main__":

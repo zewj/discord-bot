@@ -1,7 +1,11 @@
 .env
 *.bak
+*.tmp
 __pycache__/
 venv/
 .venv/
 channels.json
 channels.json.bak
+memory.json
+memory.json.bak
+memory.json.tmp
