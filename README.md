@@ -21,13 +21,25 @@ Go to https://console.anthropic.com/ and create an API key.
 
 ### 3. (Optional) Get a Giphy API key for reaction GIFs
 
-If set, the bot can post reaction GIFs of its own via the `send_gif` tool — Claude decides when a GIF fits the moment and the bot uploads it as an attachment. Without this key, the bot is text-only.
+If set, the bot can post reaction GIFs of its own via the `send_gif` tool — Claude decides when a GIF fits the moment and the bot uploads it as an attachment. Without this key, the bot can't post GIFs.
 
 1. Go to https://developers.giphy.com/dashboard/ and create an app (pick **API**, not SDK)
 2. Copy the resulting API key
 3. Set it as `GIPHY_API_KEY` (see below)
 
-### 4. Install and run
+### 4. (Optional) Get a YouTube Data API key for video links
+
+If set, the bot can search YouTube and post videos via the `send_video` tool — Claude calls it when someone says "play X", "show me that scene", "tutorial on Y", etc. Discord auto-embeds the URL as an inline player. Without this key, the video tool stays disabled.
+
+Free quota: 10,000 units/day = ~100 video searches/day. After that, requests just fail (no surprise billing) and the bot falls back to text-only.
+
+1. Go to https://console.cloud.google.com/ and create a project
+2. APIs & Services → Library → enable **YouTube Data API v3**
+3. APIs & Services → Credentials → Create Credentials → **API Key** (public data, no OAuth needed)
+4. Edit the key → restrict it to **YouTube Data API v3** only (security)
+5. Set it as `YOUTUBE_API_KEY` (see below)
+
+### 5. Install and run
 
 ```powershell
 cd C:\Users\Neko\Desktop\discord-bot
@@ -37,7 +49,8 @@ pip install -r requirements.txt
 
 $env:DISCORD_TOKEN = "your_discord_bot_token_here"
 $env:ANTHROPIC_API_KEY = "your_anthropic_api_key_here"
-$env:GIPHY_API_KEY = "your_giphy_api_key_here"  # optional — enables reaction GIFs
+$env:GIPHY_API_KEY = "your_giphy_api_key_here"   # optional — enables reaction GIFs
+$env:YOUTUBE_API_KEY = "your_youtube_api_key_here"  # optional — enables video links
 
 python bot.py
 ```
@@ -49,6 +62,7 @@ python bot.py
 - **Auto-reply channel**: run `/setup` in any channel to make the bot reply to every message there (no mention needed)
 - **Images (in)**: attach an image and the bot will see it (vision support)
 - **GIFs (out)**: with `GIPHY_API_KEY` set, the bot can post reaction GIFs back via the `send_gif` tool (Claude picks the moment and the search query)
+- **Videos (out)**: with `YOUTUBE_API_KEY` set, the bot can search YouTube and post videos via the `send_video` tool — Discord auto-embeds the URL as an inline player
 
 ## Slash commands
 

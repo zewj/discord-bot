@@ -93,6 +93,8 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 # Optional. Without it, the send_gif tool is disabled and the bot is text-only.
 GIPHY_API_KEY = os.environ.get("GIPHY_API_KEY")
+# Optional. Without it, the send_video (YouTube) tool is disabled.
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 
 # ---------- Config ----------
 
@@ -470,6 +472,80 @@ async def fetch_gif_bytes(url: str) -> bytes | None:
     except Exception as e:
         print(f"[giphy] download failed for {url}: {e}")
         return None
+
+
+# ---------- Video tool (YouTube) ----------
+
+VIDEO_TOOL = {
+    "name": "send_video",
+    "description": (
+        "Search YouTube for and post a single video that fits the moment. "
+        "Use SPARINGLY — only when a video is genuinely useful: someone asks "
+        "'play X' / 'show me that scene' / 'tutorial on Y', or when a video "
+        "punctuates the response in a way text or a GIF can't. Don't post "
+        "videos for casual chat or reactions (use send_gif for reactions). "
+        "Discord auto-embeds the URL as an inline player. "
+        "Construct the search query CAREFULLY — be specific. For songs, "
+        "include 'official' or 'official audio'; for clips, include the show "
+        "or movie name; for tutorials, include the topic and 'tutorial'."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "YouTube search query. 2-8 words is ideal. Be specific: "
+                    "'rick astley never gonna give you up official' beats "
+                    "'rick roll'. 'how to tie a tie tutorial' beats 'tie a tie'."
+                ),
+            }
+        },
+        "required": ["query"],
+    },
+}
+
+YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+YOUTUBE_WATCH_URL = "https://www.youtube.com/watch?v={vid}"
+
+
+async def search_youtube(query: str) -> tuple[str, str] | None:
+    """Return (url, title) for the top YouTube result, or None on failure."""
+    if not YOUTUBE_API_KEY:
+        return None
+    params = {
+        "key": YOUTUBE_API_KEY,
+        "q": query,
+        "part": "snippet",
+        "type": "video",
+        "maxResults": "1",
+        "safeSearch": "moderate",
+        "videoEmbeddable": "true",  # filter out videos disabled for embedding
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(YOUTUBE_SEARCH_URL, params=params) as resp:
+                if resp.status == 403:
+                    print(f"[youtube] 403 (quota or key) for query={query!r}")
+                    return None
+                if resp.status != 200:
+                    print(f"[youtube] HTTP {resp.status} for query={query!r}")
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        print(f"[youtube] search failed for query={query!r}: {e}")
+        return None
+
+    items = data.get("items") or []
+    if not items:
+        return None
+    top = items[0]
+    vid = (top.get("id") or {}).get("videoId")
+    if not vid:
+        return None
+    title = ((top.get("snippet") or {}).get("title") or "").strip() or "(untitled)"
+    return YOUTUBE_WATCH_URL.format(vid=vid), title
 
 
 # ---------- Globals ----------
@@ -987,8 +1063,13 @@ async def ask_claude(
         "max_tokens": MAX_TOKENS,
         "system": system_prompt_for(mood, rage_level),
     }
+    tools: list = []
     if GIPHY_API_KEY:
-        api_kwargs["tools"] = [GIF_TOOL]
+        tools.append(GIF_TOOL)
+    if YOUTUBE_API_KEY:
+        tools.append(VIDEO_TOOL)
+    if tools:
+        api_kwargs["tools"] = tools
 
     for attempt in range(2):
         try:
@@ -1018,6 +1099,8 @@ async def ask_claude(
         text_parts: list[str] = []
         gif_queries: list[str] = []
         gif_blobs: list[bytes] = []
+        video_notes: list[str] = []   # for history; like "(youtube: TITLE) URL"
+        video_urls: list[str] = []    # appended to outgoing reply for Discord auto-embed
         for block in response.content:
             if block.type == "text":
                 text_parts.append(block.text)
@@ -1034,14 +1117,31 @@ async def ask_claude(
                 if blob:
                     gif_blobs.append(blob)
                     print(f"[gif] posting query={query!r} ({len(blob)} bytes)")
+            elif block.type == "tool_use" and block.name == "send_video":
+                query = ((block.input or {}).get("query") or "").strip()
+                if not query:
+                    continue
+                result = await search_youtube(query)
+                if not result:
+                    print(f"[youtube] no result for query={query!r}")
+                    continue
+                url, title = result
+                video_urls.append(url)
+                video_notes.append(f"*[posted YouTube video: {title} — {url}]*")
+                print(f"[youtube] posting query={query!r} -> {url}")
 
         text = "".join(text_parts).strip()
 
         # Store text-only history (preserves user/assistant alternation across turns).
-        # Note any GIFs inline so Claude sees them in subsequent context.
+        # Note any GIFs/videos inline so Claude sees them in subsequent context.
+        notes = []
         if gif_queries:
-            note = " ".join(f"*[posted GIF: {q}]*" for q in gif_queries)
-            history_text = f"{text}\n\n{note}".strip() if text else note
+            notes.extend(f"*[posted GIF: {q}]*" for q in gif_queries)
+        if video_notes:
+            notes.extend(video_notes)
+        if notes:
+            note_str = " ".join(notes)
+            history_text = f"{text}\n\n{note_str}".strip() if text else note_str
         else:
             history_text = text
         history[key].append({"role": "assistant", "content": history_text or "(no response)"})
@@ -1050,6 +1150,12 @@ async def ask_claude(
 
         if response.stop_reason == "max_tokens" and text:
             text += "\n\n*(...cut off, hit token limit)*"
+
+        # Append YouTube URLs to the outgoing text so Discord auto-embeds them.
+        # Putting them on their own lines keeps embeds clean.
+        if video_urls:
+            url_block = "\n".join(video_urls)
+            text = f"{text}\n\n{url_block}".strip() if text else url_block
 
         if not text and not gif_blobs:
             text = "(I got nothing for you)"
@@ -1209,6 +1315,10 @@ async def on_ready():
           f"max_concurrent={MAX_CONCURRENT}")
     print(f"  memory: {len(history)} convos restored, "
           f"persistence on (every {int(MEMORY_SAVE_INTERVAL)}s)")
+    media = []
+    if GIPHY_API_KEY: media.append("gifs(giphy)")
+    if YOUTUBE_API_KEY: media.append("videos(youtube)")
+    print(f"  media tools: {', '.join(media) if media else 'none (text-only)'}")
     print("=" * 60)
 
 
@@ -1514,6 +1624,11 @@ async def status_cmd(interaction: discord.Interaction):
         f"(only matters in `escalating` mood)",
         f"**Memory cap:** {MAX_TURNS} turns / {TOKEN_BUDGET:,} tokens / {CONVERSATION_TTL // 3600}h idle",
         f"**Memory persistence:** on (flushed every {int(MEMORY_SAVE_INTERVAL)}s when changed)",
+        f"**Media tools:** "
+        + (", ".join(filter(None, [
+            "gifs (Giphy)" if GIPHY_API_KEY else None,
+            "videos (YouTube)" if YOUTUBE_API_KEY else None,
+        ])) or "none (text-only)"),
         f"**Per-user rate limit:** {USER_RATE_LIMIT} msgs / {int(USER_RATE_WINDOW)}s (per conversation)",
         f"**Max concurrent API calls:** {MAX_CONCURRENT}",
         f"**Conversation scope:** `{key}`",
