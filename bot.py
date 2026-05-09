@@ -675,9 +675,28 @@ def load_memory() -> None:
         return
 
     try:
+        # Pre-filter by TTL: anything whose last_touched is older than
+        # CONVERSATION_TTL would be evicted by the cleanup loop within an
+        # hour anyway. Drop those at load time so the bot never briefly
+        # acts like it remembers stale context after a long shutdown.
+        now = time.time()
+        cutoff = now - CONVERSATION_TTL
+        raw_touched = data.get("last_touched") or {}
+        stale_keys: set[str] = set()
+        for k, v in raw_touched.items():
+            try:
+                if float(v) < cutoff:
+                    stale_keys.add(k)
+            except (TypeError, ValueError):
+                pass
+
         loaded_convos = 0
+        skipped_stale = 0
         for k, turns in (data.get("history") or {}).items():
             if not isinstance(turns, list):
+                continue
+            if k in stale_keys:
+                skipped_stale += 1
                 continue
             dq: deque = deque(maxlen=MAX_TURNS * 2)
             for turn in turns:
@@ -692,28 +711,41 @@ def load_memory() -> None:
                 loaded_convos += 1
 
         for k, v in (data.get("rage") or {}).items():
+            if k in stale_keys:
+                continue
             try:
                 rage[k] = max(0.0, min(RAGE_MAX, float(v)))
             except (TypeError, ValueError):
                 pass
 
         for k, v in (data.get("last_input_tokens") or {}).items():
+            if k in stale_keys:
+                continue
             try:
                 last_input_tokens[k] = int(v)
             except (TypeError, ValueError):
                 pass
 
-        for k, v in (data.get("last_touched") or {}).items():
+        for k, v in raw_touched.items():
+            if k in stale_keys:
+                continue
             try:
                 last_touched[k] = float(v)
             except (TypeError, ValueError):
                 pass
 
+        # Anything we dropped here means the saved file is now out-of-date —
+        # mark dirty so the next periodic save reflects the trim.
+        if skipped_stale or stale_keys:
+            mark_memory_dirty()
+
         saved_at = data.get("saved_at")
-        age = f", age={int(time.time() - saved_at)}s" if isinstance(saved_at, (int, float)) else ""
+        age_str = f", file_age={int(now - saved_at)}s" if isinstance(saved_at, (int, float)) else ""
+        ttl_h = CONVERSATION_TTL // 3600
         print(
             f"[memory] loaded {loaded_convos} convos, "
-            f"{len(rage)} rage entries, {len(last_touched)} timestamps{age}"
+            f"{len(rage)} rage entries, {len(last_touched)} timestamps "
+            f"(skipped {skipped_stale} stale convos older than {ttl_h}h){age_str}"
         )
     except Exception as e:
         print(f"[memory] partial load error: {e}")
