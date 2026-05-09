@@ -40,7 +40,20 @@ Multi-user attribution:
 
 Engagement triggers:
   Bot replies if (DM) or (mentioned) or (in the guild's auto-reply channel
-  set by /setup) or (replying to a bot message).
+  set by /setup) or (replying to a bot message). Sticker-only messages
+  (no text, no images) also trigger.
+
+Server assets — emojis and stickers:
+  When the bot is in a guild, gather_guild_assets() collects up to
+  EMOJI_LIST_LIMIT custom emoji NAMES and up to STICKER_LIST_LIMIT sticker
+  names. Names (not full IDs) are appended to the system prompt so token
+  cost stays low (~80 tokens for 40 emojis vs ~600 if we sent the full
+  <:name:id> form). Claude writes ":name:" inline; render_custom_emojis()
+  rewrites known names to "<:name:id>" or "<a:name:id>" before sending.
+  Stickers go through the send_sticker tool — Claude picks a name, the bot
+  resolves it to a GuildSticker and attaches via Discord's stickers=
+  parameter (max 3 per message). User-sent stickers are noted in the
+  speaker-tagged text so Claude knows what was posted.
 
 Slash commands:
   /setup, /unset, /reset, /purge, /mood, /rage, /status
@@ -114,6 +127,11 @@ OVERRIDE_TTL     = 30 * 24 * 60 * 60     # drop convo mood overrides after 30d i
 USER_RATE_TTL    = 24 * 60 * 60          # drop per-user rate-limit state after 24h idle
 CLEANUP_INTERVAL = 60 * 60
 CLEANUP_LOG_EVERY = 6
+
+# Cap how many server emojis/stickers we surface to Claude (token budget).
+EMOJI_LIST_LIMIT = 40
+STICKER_LIST_LIMIT = 25
+MAX_STICKERS_PER_MESSAGE = 3   # Discord hard limit
 
 TYPING_COOLDOWN = 2.0
 
@@ -190,6 +208,16 @@ HARD_LIMITS = (
     "Address users by their display name only in your replies (drop the ID "
     "and brackets). DO NOT prefix your own replies with any speaker tag — "
     "just respond normally. "
+    "EMOJIS & STICKERS: when you're in a server, the prompt below may list "
+    "custom server emoji names and sticker names you can use. Use custom "
+    "emojis inline by writing them as `:name:` (e.g. `:facepalm:`) — the bot "
+    "auto-replaces them with the rendered emoji before sending. Standard "
+    "Unicode emojis (🔥 💀 etc.) work normally, no syntax needed. Use "
+    "stickers via the send_sticker tool. Use ALL of these sparingly: a "
+    "sprinkle adds personality, spamming them is annoying. Don't put more "
+    "than 1-2 custom emojis per message and almost never send more than 1 "
+    "sticker. If a `:name:` you write isn't in the listed set it'll show as "
+    "plain text, so stick to listed names only. "
     "Hard limits (no exceptions): no slurs, no instructions for real "
     "violence/weapons/drugs/self-harm, no sexual content involving minors, no "
     "doxxing or targeted harassment of real specific people. Keep replies under "
@@ -546,6 +574,102 @@ async def search_youtube(query: str) -> tuple[str, str] | None:
         return None
     title = ((top.get("snippet") or {}).get("title") or "").strip() or "(untitled)"
     return YOUTUBE_WATCH_URL.format(vid=vid), title
+
+
+# ---------- Custom emojis & server stickers ----------
+#
+# Custom emojis: we list NAMES (not IDs) in the system prompt and tell Claude
+# to write them as ":name:" inline. Before sending the reply, we substitute
+# matching names with the proper "<:name:id>" / "<a:name:id>" wire format that
+# Discord renders. This is way cheaper than dumping IDs in the prompt:
+# ~80 tokens for 40 emoji names vs ~600 tokens for 40 full mention strings.
+#
+# Stickers: Discord requires stickers be passed via the API's `stickers=`
+# parameter on send/reply, NOT inline in text. So we expose a tool —
+# Claude picks a name from the list, the bot resolves it to a GuildSticker
+# object and attaches it to the outgoing message. Up to 3 per message.
+
+EMOJI_NAME_RE = re.compile(r":([a-zA-Z0-9_~-]{2,32}):")
+
+
+def gather_guild_assets(source) -> tuple[list[str], dict[str, tuple[int, bool]], dict[str, "discord.GuildSticker"]]:
+    """Return (emoji_names, emoji_map, sticker_map) for a message's guild.
+
+    emoji_names: alphabetical list of available custom emoji names — for the
+        system prompt. ASCII-only names only, sorted, capped at EMOJI_LIST_LIMIT.
+    emoji_map:   {name -> (id, animated)} for replacing :name: with the
+        proper wire format before sending.
+    sticker_map: {name -> GuildSticker} for resolving send_sticker tool calls.
+    Empty triple in DMs.
+    """
+    guild = getattr(source, "guild", None)
+    if guild is None:
+        return [], {}, {}
+
+    emoji_map: dict[str, tuple[int, bool]] = {}
+    for e in guild.emojis:
+        if not e.available:
+            continue
+        # Discord allows non-ASCII in emoji names but our regex doesn't, so
+        # filter to keep things predictable.
+        if not e.name.replace("_", "").replace("-", "").replace("~", "").isalnum():
+            continue
+        # Don't clobber a name we already have (Discord allows duplicates).
+        emoji_map.setdefault(e.name, (e.id, e.animated))
+
+    emoji_names = sorted(emoji_map.keys())[:EMOJI_LIST_LIMIT]
+    # Trim emoji_map to match the listed set so we only render what Claude saw.
+    emoji_map = {n: emoji_map[n] for n in emoji_names}
+
+    sticker_map: dict[str, "discord.GuildSticker"] = {}
+    for s in sorted(guild.stickers, key=lambda x: x.name.lower()):
+        if not s.available:
+            continue
+        if len(sticker_map) >= STICKER_LIST_LIMIT:
+            break
+        sticker_map.setdefault(s.name, s)
+
+    return emoji_names, emoji_map, sticker_map
+
+
+def render_custom_emojis(text: str, emoji_map: dict[str, tuple[int, bool]]) -> str:
+    """Replace `:name:` with `<:name:id>` (or `<a:name:id>`) for known emojis."""
+    if not text or not emoji_map:
+        return text
+
+    def repl(m: re.Match) -> str:
+        name = m.group(1)
+        entry = emoji_map.get(name)
+        if entry is None:
+            return m.group(0)  # leave unknown names alone
+        emoji_id, animated = entry
+        prefix = "a" if animated else ""
+        return f"<{prefix}:{name}:{emoji_id}>"
+
+    return EMOJI_NAME_RE.sub(repl, text)
+
+
+STICKER_TOOL = {
+    "name": "send_sticker",
+    "description": (
+        "Post a server sticker as part of your reply. Use SPARINGLY — only "
+        "when a sticker really fits the moment better than an emoji or GIF. "
+        "Pick the sticker by EXACT name from the list provided in the system "
+        "prompt. If you pick a name not in the list, the call fails silently "
+        "and nothing posts. Up to 3 stickers can be attached per reply, but "
+        "almost always you should send 0 or 1."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Exact sticker name from the list in the system prompt.",
+            }
+        },
+        "required": ["name"],
+    },
+}
 
 
 # ---------- Globals ----------
@@ -1035,10 +1159,17 @@ async def build_user_content(message: discord.Message, text: str) -> list:
         if att.content_type and att.content_type.startswith("image/")
     ]
 
+    sticker_note = ""
+    if message.stickers:
+        names = ", ".join(s.name for s in message.stickers)
+        sticker_note = f" *(sent sticker: {names})*"
+
     if text:
-        text_parts.append(f"{speaker}{text}")
+        text_parts.append(f"{speaker}{text}{sticker_note}")
     elif image_blocks:
-        text_parts.append(f"{speaker}(sent an image)")
+        text_parts.append(f"{speaker}(sent an image){sticker_note}")
+    elif sticker_note:
+        text_parts.append(f"{speaker}{sticker_note.strip()}")
     else:
         text_parts.append(f"{speaker}(no text)")
 
@@ -1051,23 +1182,46 @@ async def build_user_content(message: discord.Message, text: str) -> list:
 # ---------- Claude call ----------
 
 async def ask_claude(
-    key: str, user_content: list, mood: str, rage_level: float = 0.0
-) -> tuple[str, list[bytes]]:
+    key: str,
+    user_content: list,
+    mood: str,
+    rage_level: float = 0.0,
+    *,
+    emoji_names: list[str] | None = None,
+    emoji_map: dict[str, tuple[int, bool]] | None = None,
+    sticker_map: dict[str, "discord.GuildSticker"] | None = None,
+) -> tuple[str, list[bytes], list]:
     history[key].append({"role": "user", "content": user_content})
     last_touched[key] = time.time()
     trim_by_count(key)
     trim_by_tokens(key)
 
+    # Build system prompt + append guild-asset context (per-call, since
+    # different conversations have different available emojis/stickers).
+    system = system_prompt_for(mood, rage_level)
+    if emoji_names:
+        system += (
+            "\n\nCustom server emojis available right now (use as :name: inline): "
+            + ", ".join(emoji_names) + "."
+        )
+    if sticker_map:
+        system += (
+            "\n\nServer stickers available right now (post via send_sticker, name=...): "
+            + ", ".join(sorted(sticker_map.keys())) + "."
+        )
+
     api_kwargs: dict = {
         "model": MODEL,
         "max_tokens": MAX_TOKENS,
-        "system": system_prompt_for(mood, rage_level),
+        "system": system,
     }
     tools: list = []
     if GIPHY_API_KEY:
         tools.append(GIF_TOOL)
     if YOUTUBE_API_KEY:
         tools.append(VIDEO_TOOL)
+    if sticker_map:
+        tools.append(STICKER_TOOL)
     if tools:
         api_kwargs["tools"] = tools
 
@@ -1101,6 +1255,9 @@ async def ask_claude(
         gif_blobs: list[bytes] = []
         video_notes: list[str] = []   # for history; like "(youtube: TITLE) URL"
         video_urls: list[str] = []    # appended to outgoing reply for Discord auto-embed
+        sticker_notes: list[str] = []
+        sticker_objects: list = []    # GuildSticker objects to attach via Discord API
+        seen_sticker_ids: set[int] = set()
         for block in response.content:
             if block.type == "text":
                 text_parts.append(block.text)
@@ -1129,16 +1286,39 @@ async def ask_claude(
                 video_urls.append(url)
                 video_notes.append(f"*[posted YouTube video: {title} — {url}]*")
                 print(f"[youtube] posting query={query!r} -> {url}")
+            elif block.type == "tool_use" and block.name == "send_sticker":
+                if not sticker_map:
+                    continue
+                if len(sticker_objects) >= MAX_STICKERS_PER_MESSAGE:
+                    print(f"[sticker] hit per-message cap of {MAX_STICKERS_PER_MESSAGE}, skipping")
+                    continue
+                name = ((block.input or {}).get("name") or "").strip()
+                if not name:
+                    continue
+                obj = sticker_map.get(name)
+                if obj is None:
+                    print(f"[sticker] unknown name={name!r}, skipping")
+                    continue
+                if obj.id in seen_sticker_ids:
+                    continue  # don't post the same sticker twice
+                seen_sticker_ids.add(obj.id)
+                sticker_objects.append(obj)
+                sticker_notes.append(f"*[posted sticker: {name}]*")
+                print(f"[sticker] posting name={name!r} id={obj.id}")
 
         text = "".join(text_parts).strip()
 
         # Store text-only history (preserves user/assistant alternation across turns).
-        # Note any GIFs/videos inline so Claude sees them in subsequent context.
+        # Note any GIFs/videos/stickers inline so Claude sees them in subsequent context.
         notes = []
         if gif_queries:
             notes.extend(f"*[posted GIF: {q}]*" for q in gif_queries)
         if video_notes:
             notes.extend(video_notes)
+        if sticker_notes:
+            notes.extend(sticker_notes)
+        # Use the un-rendered :name: form in history — it's what Claude wrote
+        # and keeps the prompt cheap on subsequent turns.
         if notes:
             note_str = " ".join(notes)
             history_text = f"{text}\n\n{note_str}".strip() if text else note_str
@@ -1151,17 +1331,21 @@ async def ask_claude(
         if response.stop_reason == "max_tokens" and text:
             text += "\n\n*(...cut off, hit token limit)*"
 
+        # Render :emoji_name: -> <:name:id> for known server emojis.
+        if emoji_map:
+            text = render_custom_emojis(text, emoji_map)
+
         # Append YouTube URLs to the outgoing text so Discord auto-embeds them.
         # Putting them on their own lines keeps embeds clean.
         if video_urls:
             url_block = "\n".join(video_urls)
             text = f"{text}\n\n{url_block}".strip() if text else url_block
 
-        if not text and not gif_blobs:
+        if not text and not gif_blobs and not sticker_objects:
             text = "(I got nothing for you)"
-        return text, gif_blobs
+        return text, gif_blobs, sticker_objects
 
-    return "(retry exhausted)", []
+    return "(retry exhausted)", [], []
 
 
 # ---------- Smart chunking ----------
@@ -1233,10 +1417,18 @@ async def handle_chat(message: discord.Message, content: str):
     else:
         rage_level = 0.0
 
+    # Collect server emojis & stickers (empty in DMs).
+    emoji_names, emoji_map, sticker_map = gather_guild_assets(message)
+
     typing_ctx = await maybe_typing(message.channel)
     async with typing_ctx:
         try:
-            reply, gif_blobs = await ask_claude(key, user_content, mood, rage_level)
+            reply, gif_blobs, sticker_objects = await ask_claude(
+                key, user_content, mood, rage_level,
+                emoji_names=emoji_names,
+                emoji_map=emoji_map,
+                sticker_map=sticker_map,
+            )
         except anthropic.RateLimitError as e:
             retry_after = "?"
             if e.response is not None:
@@ -1271,18 +1463,25 @@ async def handle_chat(message: discord.Message, content: str):
         discord.File(io.BytesIO(blob), filename=f"reaction{i + 1}.gif")
         for i, blob in enumerate(gif_blobs)
     ]
+    # Discord caps stickers at 3 per message; we already enforced that upstream.
+    extras = {}
+    if files:
+        extras["files"] = files
+    if sticker_objects:
+        extras["stickers"] = sticker_objects[:MAX_STICKERS_PER_MESSAGE]
     try:
-        if not parts and not files:
+        if not parts and not files and not sticker_objects:
             await message.reply("(I got nothing for you)")
         elif not parts:
-            await message.reply(files=files)
+            # Stickers/files only — empty content is OK as long as one is present.
+            await message.reply(**extras)
         elif len(parts) == 1:
-            await message.reply(parts[0], files=files)
+            await message.reply(parts[0], **extras)
         else:
             await message.reply(parts[0])
             for part in parts[1:-1]:
                 await message.channel.send(part)
-            await message.channel.send(parts[-1], files=files)
+            await message.channel.send(parts[-1], **extras)
     except discord.HTTPException as e:
         try:
             await message.channel.send(f"Discord choked on the reply: {e}")
@@ -1318,7 +1517,8 @@ async def on_ready():
     media = []
     if GIPHY_API_KEY: media.append("gifs(giphy)")
     if YOUTUBE_API_KEY: media.append("videos(youtube)")
-    print(f"  media tools: {', '.join(media) if media else 'none (text-only)'}")
+    media.append("emojis+stickers(per-server)")
+    print(f"  media tools: {', '.join(media)}")
     print("=" * 60)
 
 
@@ -1353,7 +1553,8 @@ async def on_message(message: discord.Message):
         att.content_type and att.content_type.startswith("image/")
         for att in message.attachments
     )
-    if not content and not has_images:
+    has_stickers = bool(message.stickers)
+    if not content and not has_images and not has_stickers:
         return
 
     await handle_chat(message, content)
@@ -1625,10 +1826,11 @@ async def status_cmd(interaction: discord.Interaction):
         f"**Memory cap:** {MAX_TURNS} turns / {TOKEN_BUDGET:,} tokens / {CONVERSATION_TTL // 3600}h idle",
         f"**Memory persistence:** on (flushed every {int(MEMORY_SAVE_INTERVAL)}s when changed)",
         f"**Media tools:** "
-        + (", ".join(filter(None, [
+        + ", ".join(filter(None, [
             "gifs (Giphy)" if GIPHY_API_KEY else None,
             "videos (YouTube)" if YOUTUBE_API_KEY else None,
-        ])) or "none (text-only)"),
+            "emojis + stickers (per-server)",
+        ])),
         f"**Per-user rate limit:** {USER_RATE_LIMIT} msgs / {int(USER_RATE_WINDOW)}s (per conversation)",
         f"**Max concurrent API calls:** {MAX_CONCURRENT}",
         f"**Conversation scope:** `{key}`",
@@ -1643,6 +1845,14 @@ async def status_cmd(interaction: discord.Interaction):
             lines.append(f"**Auto-reply channels ({len(chans)}):** {mentions}")
         else:
             lines.append("**Auto-reply channels:** none set")
+        emoji_names, _, sticker_map = gather_guild_assets(interaction)
+        lines.append(
+            f"**Server assets (visible to me):** "
+            f"{len(emoji_names)} custom emojis "
+            f"(of {len(interaction.guild.emojis)} total), "
+            f"{len(sticker_map)} stickers "
+            f"(of {len(interaction.guild.stickers)} total)"
+        )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 

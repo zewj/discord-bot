@@ -63,6 +63,8 @@ python bot.py
 - **Images (in)**: attach an image and the bot will see it (vision support)
 - **GIFs (out)**: with `GIPHY_API_KEY` set, the bot can post reaction GIFs back via the `send_gif` tool (Claude picks the moment and the search query)
 - **Videos (out)**: with `YOUTUBE_API_KEY` set, the bot can search YouTube and post videos via the `send_video` tool — Discord auto-embeds the URL as an inline player
+- **Custom emojis (in & out)**: the bot reads custom server emojis users send and uses them inline in its own replies (`:emoji_name:` syntax — auto-rewritten to the rendered form before sending). Up to 40 emojis per server are exposed to Claude; if your server has more, only the alphabetically-first 40 are listed
+- **Server stickers (in & out)**: the bot can read user-sent stickers (notes them in conversation context) and post stickers itself via the `send_sticker` tool. Up to 25 stickers per server are exposed; max 3 per outgoing message (Discord's hard limit)
 
 ## Slash commands
 
