@@ -1,0 +1,11 @@
+{
+  "name": "StealSticker",
+  "description": "Steal stickers on mobile with ease. Save them to your camera roll, copy the URL, or upload to a server you own.",
+  "authors": [
+    { "name": "you", "id": "0" }
+  ],
+  "main": "index.ts",
+  "vendetta": {
+    "icon": "ic_sticker_24px"
+  }
+}
