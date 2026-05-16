@@ -74,7 +74,7 @@ python bot.py
 | `/unset`  | Stop auto-replying — `scope: here` (default, just this channel) or `scope: all` (every channel in the server) |
 | `/reset`  | Wipe the bot's memory for the current conversation              |
 | `/purge`  | Nuke memory; scope `here` (this convo) or `server` (every convo in the guild — Manage Channels required) |
-| `/mood`   | Switch personality preset (`escalating` / `feral` / `villain` / `chill`) — scope `server` or `here` |
+| `/mood`   | Switch personality preset (`escalating` / `feral` / `villain` / `chill` / `tsundere`) — scope `server` or `here` |
 | `/rage`   | Show the current patience meter for this conversation (with bar + tier) |
 | `/status` | Show model, mood, memory, scope, active conversation count      |
 
@@ -90,6 +90,7 @@ Per-conversation overrides win over server defaults. All settings persist to `ch
 - **`feral`** — Immediately unhinged, no warmup. The OG.
 - **`villain`** — Theatrical Saturday-morning supervillain.
 - **`chill`** — Friendly, mildly sarcastic, swears sparingly.
+- **`tsundere`** — Cold and prickly on the surface, secretly invested. Pretends not to want to help, then helps thoroughly. Stutters when flustered. "B-baka!" energy. Never actually cruel — the bark is for show.
 
 Use `/status` to see the current patience meter for a conversation. `/reset` and `/purge` both wipe it.
 
