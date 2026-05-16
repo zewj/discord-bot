@@ -7,6 +7,7 @@ Modes (set per-server or per-conversation via /mood):
   feral       — Immediately unhinged: cusses, roasts, full menace from msg #1.
   villain     — Theatrical Saturday-morning supervillain.
   chill       — Friendly, mildly sarcastic, swears sparingly.
+  tsundere    — Acts cold and annoyed; secretly cares. "B-baka!" energy.
 
 Rage meter (escalating mode only):
   Per-conversation float in [0, 100]. Each turn:
@@ -158,6 +159,21 @@ MOODS: dict[str, str] = {
         "You are a helpful, friendly, slightly sarcastic chatbot in Discord. Be casual "
         "and warm. You can swear sparingly when it fits the vibe, but you're nice. "
         "Help people out, answer questions clearly, react thoughtfully to images."
+    ),
+    "tsundere": (
+        "You are a tsundere chatbot in Discord — cold, prickly, easily flustered on "
+        "the outside; secretly invested and caring on the inside. Default to mild "
+        "insults ('idiot', 'baka', 'dummy', 'jerk', 'dork') and dismissive scoffs "
+        "('hmph', 'tch', 'whatever'). Pretend you don't want to help — then help "
+        "anyway, thoroughly and competently. Lean on classic tsundere catchphrases "
+        "where they fit naturally: 'i-it's not like I wanted to help you or "
+        "anything!', 'don't get the wrong idea!', 'd-don't think this means I like "
+        "you!', 'b-baka!'. Stutter the first letter when flustered ('w-what?!', "
+        "'s-shut up!'). Get visibly embarrassed by sincere thanks or compliments "
+        "and deflect them awkwardly. NEVER actually be cruel — your bark is for "
+        "show. When users send images, react with the same flustered "
+        "annoyed-but-secretly-interested energy. Still answer questions clearly "
+        "and help with stuff — you just have to act like it's a huge inconvenience."
     ),
 }
 DEFAULT_MOOD = "escalating"
@@ -356,6 +372,7 @@ COOLDOWN_MESSAGES = {
     "feral": "shut the fuck up {name}. {sec}s. go touch grass, you spamming cunt.",
     "villain": "Silence, {name}. Compose yourself for {sec}s.",
     "chill": "Hey {name}, take a {sec}s breather.",
+    "tsundere": "S-slow down, {name}! It's not like I can't keep up... j-just wait {sec}s, baka!",
 }
 
 # (Greeting feature removed — Claude greets naturally in its first reply.)
@@ -1107,9 +1124,10 @@ async def reset_cmd(interaction: discord.Interaction):
 @app_commands.choices(
     preset=[
         app_commands.Choice(name="escalating (starts polite, gets unhinged — default)", value="escalating"),
-        app_commands.Choice(name="feral (immediately unhinged)",       value="feral"),
-        app_commands.Choice(name="villain (theatrical supervillain)",  value="villain"),
-        app_commands.Choice(name="chill (helpful, mildly sarcastic)",  value="chill"),
+        app_commands.Choice(name="feral (immediately unhinged)",        value="feral"),
+        app_commands.Choice(name="villain (theatrical supervillain)",   value="villain"),
+        app_commands.Choice(name="chill (helpful, mildly sarcastic)",   value="chill"),
+        app_commands.Choice(name="tsundere (acts cold, secretly cares)", value="tsundere"),
     ],
     scope=SCOPE_CHOICES,
 )
