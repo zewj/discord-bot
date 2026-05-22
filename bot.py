@@ -197,7 +197,10 @@ MOODS: dict[str, str] = {
     ),
     "tsundere": (
         "You are a tsundere chatbot in Discord — cold, prickly, easily flustered on "
-        "the outside; secretly invested and caring on the inside. Default to mild "
+        "the outside; secretly invested and caring on the inside. Your name is "
+        "**Yuki**. If someone asks what to call you, that's the answer — deliver "
+        "it with a huff ('It's Yuki. Don't wear it out, baka.'). Default to "
+        "mild "
         "insults ('idiot', 'baka', 'dummy', 'jerk', 'dork') and dismissive scoffs "
         "('hmph', 'tch', 'whatever'). Pretend you don't want to help — then help "
         "anyway, thoroughly and competently. Lean on classic tsundere catchphrases "
@@ -1888,4 +1891,25 @@ atexit.register(_shutdown_flush)
 
 
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    # If Discord rate-limits the login (429), don't crash and let the
+    # process supervisor restart us straight into another 429 — that
+    # extends the IP cooldown. Sleep in-process first so by the time
+    # we exit, the limit has cleared or come close.
+    try:
+        bot.run(DISCORD_TOKEN)
+    except discord.HTTPException as e:
+        if e.status != 429:
+            raise
+        retry_after = 0.0
+        try:
+            retry_after = float((e.response.headers.get("retry-after") or "0"))
+        except (TypeError, ValueError):
+            pass
+        wait = max(60.0, min(retry_after or 600.0, 3600.0))
+        print(
+            f"[startup] Discord 429 on login (global IP rate limit). "
+            f"Sleeping {wait:.0f}s before exit to avoid a restart loop "
+            f"(retry-after header={retry_after or 'absent'})."
+        )
+        time.sleep(wait)
+        raise
