@@ -1690,10 +1690,13 @@ class GuildMusic:
             self.queue.append(track)
             position = len(self.queue) + (1 if self.current else 0)
         if not self.is_active() and self.current is None:
-            await self._advance()
+            # Kickoff path: caller (the /play command) already tells the user
+            # what's playing, so suppress the auto-announce to avoid a double
+            # message. Subsequent advances triggered by _after_play DO announce.
+            await self._advance(announce=False)
         return position
 
-    async def _advance(self) -> None:
+    async def _advance(self, announce: bool = True) -> None:
         async with self._lock:
             if not self.queue:
                 self.current = None
@@ -1720,7 +1723,8 @@ class GuildMusic:
             return
 
         self._cancel_idle_disconnect()
-        await self._announce_now_playing()
+        if announce:
+            await self._announce_now_playing()
 
     def _after_play(self, error: Exception | None) -> None:
         # Called from a non-async thread by discord.py's audio player.
