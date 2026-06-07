@@ -1608,7 +1608,8 @@ MUSIC_AVAILABLE = FFMPEG_AVAILABLE and YTDLP_AVAILABLE
 MUSIC_IDLE_TIMEOUT = 5 * 60       # disconnect after this many seconds of nothing playing
 MUSIC_MAX_QUEUE = 100             # cap per guild
 MUSIC_SEARCH_TIMEOUT = 15         # yt-dlp resolution timeout (seconds)
-MUSIC_EMBED_COLOR = 0x5865F2      # Discord blurple
+MUSIC_EMBED_COLOR = 0xED4245      # Vivid red — distinct from chat embeds
+MUSIC_PROGRESS_WIDTH = 18         # progress-bar character width
 
 YTDL_OPTS = {
     "format": "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
@@ -1638,6 +1639,7 @@ class Track:
     requester_id: int
     requester_name: str
     thumbnail_url: str | None = None
+    uploader: str | None = None        # e.g. "Rick Astley" — YouTube channel name
 
     def duration_str(self) -> str:
         if not self.duration:
@@ -1663,6 +1665,11 @@ class GuildMusic:
         self.last_text_channel_id: int | None = None
         self._lock = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
+        # Playback timer for the current track. _started_at is set when the
+        # track (re)starts playing and cleared on pause; _accumulated holds
+        # elapsed time accrued before pauses so resume picks up cleanly.
+        self._started_at: float | None = None
+        self._accumulated: float = 0.0
 
     # ---- state queries ----
 
@@ -1674,6 +1681,43 @@ class GuildMusic:
 
     def is_active(self) -> bool:
         return self.is_playing() or self.is_paused()
+
+    # ---- playback timer ----
+
+    def elapsed(self) -> float:
+        """Best-guess seconds elapsed in the current track."""
+        if self._started_at is None:
+            return self._accumulated
+        return self._accumulated + (time.time() - self._started_at)
+
+    def _start_timer(self) -> None:
+        self._started_at = time.time()
+        self._accumulated = 0.0
+
+    def _pause_timer(self) -> None:
+        if self._started_at is not None:
+            self._accumulated += time.time() - self._started_at
+            self._started_at = None
+
+    def _resume_timer(self) -> None:
+        if self._started_at is None:
+            self._started_at = time.time()
+
+    # ---- pause / resume ----
+
+    def pause(self) -> bool:
+        if not self.is_playing():
+            return False
+        self.voice.pause()
+        self._pause_timer()
+        return True
+
+    def resume(self) -> bool:
+        if not self.is_paused():
+            return False
+        self.voice.resume()
+        self._resume_timer()
+        return True
 
     # ---- voice connection ----
 
@@ -1724,6 +1768,7 @@ class GuildMusic:
             asyncio.create_task(self._advance())
             return
 
+        self._start_timer()
         self._cancel_idle_disconnect()
         if announce:
             await self._announce_now_playing()
@@ -1744,8 +1789,9 @@ class GuildMusic:
         if channel is None:
             return
         try:
+            # Auto-announce fires the moment a track starts → elapsed ≈ 0.
             await channel.send(
-                embed=_track_embed(self.current, "▶ Now Playing"),
+                embed=_track_embed(self.current, "🎵 Now Playing", elapsed=0.0),
                 view=MusicControls(),
             )
         except discord.HTTPException:
@@ -1870,22 +1916,64 @@ async def resolve_track(query: str, requester: discord.Member) -> Track | None:
         requester_id=requester.id,
         requester_name=requester.display_name,
         thumbnail_url=thumb_url,
+        uploader=info.get("uploader") or info.get("channel") or info.get("creator"),
     )
 
 
-def _track_embed(track: Track, title: str = "▶ Now Playing", position: int | None = None) -> discord.Embed:
-    """Minimal track embed: just the linked title + a small footer."""
+def _format_time(seconds: float) -> str:
+    s = max(0, int(seconds))
+    m, s = divmod(s, 60)
+    if m >= 60:
+        h, m = divmod(m, 60)
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def _progress_bar(elapsed: float, total: float | None, width: int = MUSIC_PROGRESS_WIDTH) -> str:
+    """Static progress bar — accurate at render time, doesn't live-update."""
+    if not total or total <= 0:
+        return "▬" * width
+    ratio = max(0.0, min(1.0, elapsed / total))
+    pos = int(round(ratio * (width - 1)))
+    return "▬" * pos + "🔘" + "▬" * (width - 1 - pos)
+
+
+def _track_embed(
+    track: Track,
+    header: str = "🎵 Now Playing",
+    position: int | None = None,
+    elapsed: float = 0.0,
+    paused: bool = False,
+) -> discord.Embed:
+    """Rythm-style track embed: author/header, hyperlinked title, uploader,
+    progress bar with time stamps, thumbnail, and a requester footer."""
     embed = discord.Embed(
-        description=f"**{title}**\n[{track.title}]({track.webpage_url})",
+        title=track.title,
+        url=track.webpage_url,
         color=MUSIC_EMBED_COLOR,
     )
-    footer_parts = []
-    duration = track.duration_str().strip(" ()")
-    if duration:
-        footer_parts.append(duration)
+    embed.set_author(name=("⏸ Paused" if paused else header))
+
+    desc_parts: list[str] = []
+    if track.uploader:
+        desc_parts.append(f"by **{track.uploader}**")
+    if track.duration:
+        bar = _progress_bar(elapsed, track.duration)
+        timing = f"`{_format_time(elapsed)} / {_format_time(track.duration)}`"
+        desc_parts.append(f"\n{bar}\n{timing}")
+    elif position is None:
+        # Live stream or unknown duration — show elapsed only.
+        desc_parts.append(f"\n`{_format_time(elapsed)}`")
+    if desc_parts:
+        embed.description = "\n".join(desc_parts)
+
+    if track.thumbnail_url:
+        embed.set_thumbnail(url=track.thumbnail_url)
+
+    footer_parts: list[str] = []
     if position is not None:
-        footer_parts.append(f"queue #{position}")
-    footer_parts.append(f"requested by {track.requester_name}")
+        footer_parts.append(f"#{position} in queue")
+    footer_parts.append(f"Requested by {track.requester_name}")
     embed.set_footer(text=" • ".join(footer_parts))
     return embed
 
@@ -1932,11 +2020,9 @@ class MusicControls(discord.ui.View):
         music = await self._music(interaction)
         if music is None:
             return
-        if music.is_playing():
-            music.voice.pause()
+        if music.pause():
             await interaction.response.send_message("⏸ Paused.", ephemeral=True)
-        elif music.is_paused():
-            music.voice.resume()
+        elif music.resume():
             await interaction.response.send_message("▶ Resumed.", ephemeral=True)
         else:
             await interaction.response.send_message("Nothing playing.", ephemeral=True)
@@ -2350,12 +2436,12 @@ async def play_cmd(interaction: discord.Interaction, query: str):
     position = await music.enqueue(track)
     if started_immediately:
         await interaction.followup.send(
-            embed=_track_embed(track, "▶ Now Playing"),
+            embed=_track_embed(track, "🎵 Now Playing", elapsed=0.0),
             view=MusicControls(),
         )
     else:
         await interaction.followup.send(
-            embed=_track_embed(track, "➕ Queued", position=position)
+            embed=_track_embed(track, "➕ Added to Queue", position=position)
         )
 
 
@@ -2365,10 +2451,9 @@ async def pause_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
     music = guild_music.get(interaction.guild.id)
-    if not music or not music.is_playing():
+    if not music or not music.pause():
         await interaction.response.send_message("Nothing playing.", ephemeral=True)
         return
-    music.voice.pause()
     await interaction.response.send_message("⏸ Paused.")
 
 
@@ -2378,10 +2463,9 @@ async def resume_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
     music = guild_music.get(interaction.guild.id)
-    if not music or not music.is_paused():
+    if not music or not music.resume():
         await interaction.response.send_message("Nothing paused.", ephemeral=True)
         return
-    music.voice.resume()
     await interaction.response.send_message("▶ Resumed.")
 
 
@@ -2434,9 +2518,13 @@ async def nowplaying_cmd(interaction: discord.Interaction):
     if not music or music.current is None:
         await interaction.response.send_message("Nothing playing.", ephemeral=True)
         return
-    title = "⏸ Paused" if music.is_paused() else "▶ Now Playing"
     await interaction.response.send_message(
-        embed=_track_embed(music.current, title),
+        embed=_track_embed(
+            music.current,
+            "🎵 Now Playing",
+            elapsed=music.elapsed(),
+            paused=music.is_paused(),
+        ),
         view=MusicControls(),
         ephemeral=True,
     )
