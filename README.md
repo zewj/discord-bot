@@ -12,7 +12,7 @@ A Discord bot powered by Claude (claude-sonnet-4-6) with an unhinged, evil, devi
 4. Under **Privileged Gateway Intents**, enable **MESSAGE CONTENT INTENT**
 5. Go to **OAuth2 → URL Generator**:
    - Scopes: `bot`
-   - Bot Permissions: `Send Messages`, `Read Message History`, `Use External Emojis`, `Attach Files`, `Embed Links`
+   - Bot Permissions: `Send Messages`, `Read Message History`, `Use External Emojis`, `Attach Files`, `Embed Links`, `Connect`, `Speak` (last two for music)
 6. Open the generated URL to invite the bot to your server
 
 ### 2. Get an Anthropic API key
@@ -39,7 +39,17 @@ Free quota: 10,000 units/day = ~100 video searches/day. After that, requests jus
 4. Edit the key → restrict it to **YouTube Data API v3** only (security)
 5. Set it as `YOUTUBE_API_KEY` (see below)
 
-### 5. Install and run
+### 5. (Optional) Install `ffmpeg` for music playback
+
+Required by the `/play` voice commands. Without it, the music commands log a clear "disabled" message at startup and refuse to run; everything else still works.
+
+- **Linux/Pterodactyl**: `apt install ffmpeg` (or whatever your egg's package manager uses). Verify with `ffmpeg -version`.
+- **Windows**: download from https://ffmpeg.org/download.html and add to PATH.
+- **macOS**: `brew install ffmpeg`.
+
+The Python side (`yt-dlp`) is installed automatically via `requirements.txt`.
+
+### 6. Install and run
 
 ```powershell
 cd C:\Users\Neko\Desktop\discord-bot
@@ -65,6 +75,7 @@ python bot.py
 - **Videos (out)**: with `YOUTUBE_API_KEY` set, the bot can search YouTube and post videos via the `send_video` tool — Discord auto-embeds the URL as an inline player
 - **Custom emojis (in & out)**: the bot reads custom server emojis users send and uses them inline in its own replies (`:emoji_name:` syntax — auto-rewritten to the rendered form before sending). Up to 40 emojis per server are exposed to Claude; if your server has more, only the alphabetically-first 40 are listed
 - **Server stickers (in & out)**: the bot can read user-sent stickers (notes them in conversation context) and post stickers itself via the `send_sticker` tool. Up to 25 stickers per server are exposed; max 3 per outgoing message (Discord's hard limit)
+- **Music playback**: if `ffmpeg` is installed on the host, the bot joins your voice channel and streams audio. Join a voice channel, then run `/play <YouTube URL or search>`. Source: YouTube (via `yt-dlp`). Auto-disconnects after 5 minutes idle
 
 ## Slash commands
 
@@ -77,6 +88,14 @@ python bot.py
 | `/mood`   | Switch personality preset (`escalating` / `feral` / `villain` / `chill` / `tsundere`) — scope `server` or `here` |
 | `/rage`   | Show the current patience meter for this conversation (with bar + tier) |
 | `/status` | Show model, mood, memory, scope, active conversation count      |
+| `/play`   | Join your voice channel and queue a track from YouTube (URL or search) |
+| `/pause`  | Pause the current track                                         |
+| `/resume` | Resume a paused track                                           |
+| `/skip`   | Skip to the next track in the queue                             |
+| `/stop`   | Clear the queue and stop playback                               |
+| `/queue`  | Show what's queued                                              |
+| `/nowplaying` | Show what's playing right now                               |
+| `/leave`  | Disconnect from voice                                           |
 
 `/mood` accepts a `scope` arg:
 - `server` (default) — applies to the whole guild (requires Manage Channels)
