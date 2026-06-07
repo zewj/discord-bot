@@ -49,7 +49,18 @@ Required by the `/play` voice commands. Without it, the music commands log a cle
 
 The Python side (`yt-dlp`) is installed automatically via `requirements.txt`.
 
-### 6. Install and run
+### 6. (Optional) Spotify credentials for Spotify-link parsing
+
+Without these, `/play` still works for YouTube, SoundCloud, and Apple Music URLs — but pasting a Spotify link returns "couldn't resolve". With them, Spotify URLs are converted to a `"Title Artist"` YouTube search and played from there (Spotify's API doesn't expose audio streams, so this is the only legal route).
+
+1. Go to https://developer.spotify.com/dashboard, log in, **Create app**
+2. Any name/description; redirect URI doesn't matter — leave it as `http://localhost`
+3. Open the app → **Settings** → copy **Client ID** and **Client secret**
+4. Set them as `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`
+
+Apple Music link parsing needs no credentials — uses the free iTunes Search API.
+
+### 7. Install and run
 
 ```powershell
 cd C:\Users\Neko\Desktop\discord-bot
@@ -61,6 +72,8 @@ $env:DISCORD_TOKEN = "your_discord_bot_token_here"
 $env:ANTHROPIC_API_KEY = "your_anthropic_api_key_here"
 $env:GIPHY_API_KEY = "your_giphy_api_key_here"   # optional — enables reaction GIFs
 $env:YOUTUBE_API_KEY = "your_youtube_api_key_here"  # optional — enables video links
+$env:SPOTIFY_CLIENT_ID = "your_spotify_client_id"          # optional — Spotify link parsing
+$env:SPOTIFY_CLIENT_SECRET = "your_spotify_client_secret"  # optional — Spotify link parsing
 
 python bot.py
 ```
@@ -75,7 +88,15 @@ python bot.py
 - **Videos (out)**: with `YOUTUBE_API_KEY` set, the bot can search YouTube and post videos via the `send_video` tool — Discord auto-embeds the URL as an inline player
 - **Custom emojis (in & out)**: the bot reads custom server emojis users send and uses them inline in its own replies (`:emoji_name:` syntax — auto-rewritten to the rendered form before sending). Up to 40 emojis per server are exposed to Claude; if your server has more, only the alphabetically-first 40 are listed
 - **Server stickers (in & out)**: the bot can read user-sent stickers (notes them in conversation context) and post stickers itself via the `send_sticker` tool. Up to 25 stickers per server are exposed; max 3 per outgoing message (Discord's hard limit)
-- **Music playback**: if `ffmpeg` is installed on the host, the bot joins your voice channel and streams audio. Join a voice channel, then run `/play <YouTube URL or search>`. Source: YouTube (via `yt-dlp`). Auto-disconnects after 5 minutes idle
+- **Music playback**: if `ffmpeg` is installed on the host, the bot joins your voice channel and streams audio. Join a voice channel, then run `/play <URL or search>`. Sources:
+  - **YouTube** — URL or plain search text (default)
+  - **SoundCloud** — paste a track URL (handled natively by `yt-dlp`)
+  - **Spotify** — paste a track URL/URI (`open.spotify.com/track/…` or `spotify:track:…`); requires `SPOTIFY_CLIENT_ID` + `SPOTIFY_CLIENT_SECRET`. Spotify doesn't stream audio via its API, so the bot reads track metadata and plays the equivalent from YouTube
+  - **Apple Music** — paste a single-track URL (`music.apple.com/…?i=…`); no credentials needed (uses iTunes Search API)
+  - **Playlists & albums** — paste a YouTube playlist, SoundCloud set, Spotify playlist/album, or Apple Music album URL to queue all of it at once (capped at 50 tracks). Playlist tracks resolve lazily — each one's stream is fetched just before it plays, so big queues start instantly and stream URLs never go stale. (Apple Music *curated playlists* aren't supported — not exposed by the iTunes API — but albums are.)
+  - **Now-playing embed** has a **live progress bar** that updates as the track plays, plus ⏮ ⏯ ⏭ ⏹ / 🔁 🔀 buttons
+  - **DJ role** (optional): run `/dj role:@DJ` to lock the control actions (skip, stop, pause, loop, volume, shuffle, remove, clear, jump, leave — slash commands *and* the embed buttons) to that role. Anyone with Manage Server bypasses it. `/play`, `/queue`, and `/nowplaying` stay open to everyone. `/djoff` removes the lock. With no DJ role set, controls are open to all (default)
+  - Auto-disconnects after 5 minutes idle
 
 ## Slash commands
 
@@ -88,7 +109,7 @@ python bot.py
 | `/mood`   | Switch personality preset (`escalating` / `feral` / `villain` / `chill` / `tsundere`) — scope `server` or `here` |
 | `/rage`   | Show the current patience meter for this conversation (with bar + tier) |
 | `/status` | Show model, mood, memory, scope, active conversation count      |
-| `/play`   | Join your voice channel and queue a track from YouTube (URL or search) |
+| `/play`   | Join voice and queue a track **or playlist/album** from YouTube/SoundCloud/Spotify/Apple Music (URL or search) |
 | `/pause`  | Pause the current track                                         |
 | `/resume` | Resume a paused track                                           |
 | `/skip`   | Skip to the next track in the queue                             |
@@ -96,6 +117,14 @@ python bot.py
 | `/queue`  | Show what's queued                                              |
 | `/nowplaying` | Show what's playing right now                               |
 | `/leave`  | Disconnect from voice                                           |
+| `/loop`   | Loop the current track, the queue, or turn looping off          |
+| `/shuffle`| Shuffle the queue                                               |
+| `/volume` | Set playback volume 0-200% (default 100)                        |
+| `/remove` | Remove a track from the queue by position                       |
+| `/clear`  | Clear the queue but keep the current track playing              |
+| `/jump`   | Skip ahead to a specific queue position                         |
+| `/dj`     | Set the DJ role (only it can control playback), or show the current one (Manage Channels to set) |
+| `/djoff`  | Clear the DJ role so everyone can control playback again (Manage Channels) |
 
 `/mood` accepts a `scope` arg:
 - `server` (default) — applies to the whole guild (requires Manage Channels)
