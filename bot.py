@@ -1608,6 +1608,7 @@ MUSIC_AVAILABLE = FFMPEG_AVAILABLE and YTDLP_AVAILABLE
 MUSIC_IDLE_TIMEOUT = 5 * 60       # disconnect after this many seconds of nothing playing
 MUSIC_MAX_QUEUE = 100             # cap per guild
 MUSIC_SEARCH_TIMEOUT = 15         # yt-dlp resolution timeout (seconds)
+MUSIC_EMBED_COLOR = 0x5865F2      # Discord blurple
 
 YTDL_OPTS = {
     "format": "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
@@ -1636,6 +1637,7 @@ class Track:
     duration: int | None
     requester_id: int
     requester_name: str
+    thumbnail_url: str | None = None
 
     def duration_str(self) -> str:
         if not self.duration:
@@ -1742,10 +1744,7 @@ class GuildMusic:
         if channel is None:
             return
         try:
-            await channel.send(
-                f"▶ Now playing {self.current.display()} "
-                f"— requested by **{self.current.requester_name}**"
-            )
+            await channel.send(embed=_track_embed(self.current, "▶ Now Playing"))
         except discord.HTTPException:
             pass
 
@@ -1840,6 +1839,14 @@ async def resolve_track(query: str, requester: discord.Member) -> Track | None:
     if not stream_url:
         return None
 
+    # yt-dlp returns either a single URL or a "thumbnails" list (sorted ascending
+    # by resolution); the last entry is usually highest-res.
+    thumb_url = info.get("thumbnail")
+    if not thumb_url:
+        thumbnails = info.get("thumbnails") or []
+        if thumbnails:
+            thumb_url = thumbnails[-1].get("url")
+
     return Track(
         stream_url=stream_url,
         webpage_url=info.get("webpage_url") or info.get("original_url") or query,
@@ -1847,7 +1854,26 @@ async def resolve_track(query: str, requester: discord.Member) -> Track | None:
         duration=int(info["duration"]) if info.get("duration") else None,
         requester_id=requester.id,
         requester_name=requester.display_name,
+        thumbnail_url=thumb_url,
     )
+
+
+def _track_embed(track: Track, title: str, position: int | None = None) -> discord.Embed:
+    """Build a Discord embed for a single track (play / queued / now playing)."""
+    embed = discord.Embed(
+        title=title,
+        description=f"[{track.title}]({track.webpage_url})",
+        color=MUSIC_EMBED_COLOR,
+    )
+    if track.thumbnail_url:
+        embed.set_thumbnail(url=track.thumbnail_url)
+    duration = track.duration_str().strip(" ()")
+    if duration:
+        embed.add_field(name="Duration", value=duration, inline=True)
+    embed.add_field(name="Requested by", value=track.requester_name, inline=True)
+    if position is not None:
+        embed.add_field(name="Position", value=f"#{position}", inline=True)
+    return embed
 
 
 def _music_unavailable_msg() -> str:
@@ -2230,9 +2256,11 @@ async def play_cmd(interaction: discord.Interaction, query: str):
     started_immediately = (music.current is None) and not music.is_active()
     position = await music.enqueue(track)
     if started_immediately:
-        await interaction.followup.send(f"▶ Playing {track.display()}.")
+        await interaction.followup.send(embed=_track_embed(track, "▶ Now Playing"))
     else:
-        await interaction.followup.send(f"➕ Queued **#{position}**: {track.display()}.")
+        await interaction.followup.send(
+            embed=_track_embed(track, "➕ Queued", position=position)
+        )
 
 
 @tree.command(name="pause", description="Pause the current track.")
@@ -2310,10 +2338,9 @@ async def nowplaying_cmd(interaction: discord.Interaction):
     if not music or music.current is None:
         await interaction.response.send_message("Nothing playing.", ephemeral=True)
         return
-    state = "⏸ Paused" if music.is_paused() else "▶ Playing"
+    title = "⏸ Paused" if music.is_paused() else "▶ Now Playing"
     await interaction.response.send_message(
-        f"{state}: {music.current.display()} — requested by **{music.current.requester_name}**",
-        ephemeral=True,
+        embed=_track_embed(music.current, title), ephemeral=True
     )
 
 
@@ -2326,17 +2353,26 @@ async def queue_cmd(interaction: discord.Interaction):
     if not music or (not music.current and not music.queue):
         await interaction.response.send_message("Queue is empty.", ephemeral=True)
         return
-    lines: list[str] = []
+    embed = discord.Embed(title="🎵 Queue", color=MUSIC_EMBED_COLOR)
     if music.current:
         marker = "⏸" if music.is_paused() else "▶"
-        lines.append(f"{marker} **Now:** {music.current.display()}")
+        embed.add_field(
+            name=f"{marker} Now playing",
+            value=f"{music.current.display()} — *{music.current.requester_name}*",
+            inline=False,
+        )
+        if music.current.thumbnail_url:
+            embed.set_thumbnail(url=music.current.thumbnail_url)
     if music.queue:
-        lines.append(f"\n**Up next** ({len(music.queue)}):")
-        for i, t in enumerate(list(music.queue)[:10], 1):
-            lines.append(f"`{i:2d}.` {t.display()}")
+        lines = [f"`{i:2d}.` {t.display()}" for i, t in enumerate(list(music.queue)[:10], 1)]
         if len(music.queue) > 10:
             lines.append(f"_…and {len(music.queue) - 10} more_")
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        embed.add_field(
+            name=f"Up next ({len(music.queue)})",
+            value="\n".join(lines),
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 def _shutdown_flush():
