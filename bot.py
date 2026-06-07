@@ -86,8 +86,10 @@ import json
 import os
 import random
 import re
+import shutil
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
@@ -95,6 +97,13 @@ import discord
 from discord import app_commands
 import anthropic
 from anthropic import AsyncAnthropic
+
+try:
+    import yt_dlp  # type: ignore
+    YTDLP_AVAILABLE = True
+except ImportError:
+    yt_dlp = None
+    YTDLP_AVAILABLE = False
 
 # Load .env if present (no-op if file/lib missing — falls back to OS env vars).
 try:
@@ -699,6 +708,7 @@ api_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True       # required for voice playback (/play, etc.)
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
@@ -1538,7 +1548,16 @@ async def on_ready():
     if GIPHY_API_KEY: media.append("gifs(giphy)")
     if YOUTUBE_API_KEY: media.append("videos(youtube)")
     media.append("emojis+stickers(per-server)")
+    if MUSIC_AVAILABLE:
+        media.append("music(voice+yt-dlp)")
     print(f"  media tools: {', '.join(media)}")
+    if not MUSIC_AVAILABLE:
+        missing = []
+        if not FFMPEG_AVAILABLE:
+            missing.append("ffmpeg(system binary)")
+        if not YTDLP_AVAILABLE:
+            missing.append("yt-dlp(pip)")
+        print(f"  music: DISABLED — missing {', '.join(missing)}")
     print("=" * 60)
 
 
@@ -1578,6 +1597,273 @@ async def on_message(message: discord.Message):
         return
 
     await handle_chat(message, content)
+
+
+# ---------- Music playback (voice + yt-dlp + ffmpeg) ----------
+
+FFMPEG_PATH = shutil.which("ffmpeg")
+FFMPEG_AVAILABLE = FFMPEG_PATH is not None
+MUSIC_AVAILABLE = FFMPEG_AVAILABLE and YTDLP_AVAILABLE
+
+MUSIC_IDLE_TIMEOUT = 5 * 60       # disconnect after this many seconds of nothing playing
+MUSIC_MAX_QUEUE = 100             # cap per guild
+MUSIC_SEARCH_TIMEOUT = 15         # yt-dlp resolution timeout (seconds)
+
+YTDL_OPTS = {
+    "format": "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
+    "quiet": True,
+    "no_warnings": True,
+    "default_search": "ytsearch1",
+    "source_address": "0.0.0.0",
+    "noplaylist": True,
+    "extract_flat": False,
+    "skip_download": True,
+}
+
+# -nostdin keeps ffmpeg from grabbing the bot's stdin and racing other input.
+# Reconnect flags help with intermittent stream drops on long tracks.
+FFMPEG_BEFORE_OPTS = (
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
+)
+FFMPEG_OPTS = "-vn -loglevel warning"
+
+
+@dataclass
+class Track:
+    stream_url: str
+    webpage_url: str
+    title: str
+    duration: int | None
+    requester_id: int
+    requester_name: str
+
+    def duration_str(self) -> str:
+        if not self.duration:
+            return ""
+        m, s = divmod(int(self.duration), 60)
+        if m >= 60:
+            h, m = divmod(m, 60)
+            return f" ({h}:{m:02d}:{s:02d})"
+        return f" ({m}:{s:02d})"
+
+    def display(self) -> str:
+        return f"[{self.title}]({self.webpage_url}){self.duration_str()}"
+
+
+class GuildMusic:
+    """Per-guild voice state: queue, current track, idle disconnect, etc."""
+
+    def __init__(self, guild_id: int):
+        self.guild_id = guild_id
+        self.voice: discord.VoiceClient | None = None
+        self.queue: deque[Track] = deque()
+        self.current: Track | None = None
+        self.last_text_channel_id: int | None = None
+        self._lock = asyncio.Lock()
+        self._idle_task: asyncio.Task | None = None
+
+    # ---- state queries ----
+
+    def is_playing(self) -> bool:
+        return self.voice is not None and self.voice.is_playing()
+
+    def is_paused(self) -> bool:
+        return self.voice is not None and self.voice.is_paused()
+
+    def is_active(self) -> bool:
+        return self.is_playing() or self.is_paused()
+
+    # ---- voice connection ----
+
+    async def ensure_voice(self, channel: discord.abc.Connectable) -> None:
+        if self.voice is None or not self.voice.is_connected():
+            self.voice = await channel.connect(self_deaf=True, reconnect=True)
+        elif self.voice.channel != channel:
+            await self.voice.move_to(channel)
+
+    # ---- queue ops ----
+
+    async def enqueue(self, track: Track) -> int:
+        """Append to queue. Returns 1-indexed position in the playback sequence
+        (1 means it will start playing immediately)."""
+        async with self._lock:
+            self.queue.append(track)
+            position = len(self.queue) + (1 if self.current else 0)
+        if not self.is_active() and self.current is None:
+            await self._advance()
+        return position
+
+    async def _advance(self) -> None:
+        async with self._lock:
+            if not self.queue:
+                self.current = None
+                self._schedule_idle_disconnect()
+                return
+            self.current = self.queue.popleft()
+
+        if self.voice is None or not self.voice.is_connected():
+            self.current = None
+            return
+
+        try:
+            source = discord.FFmpegPCMAudio(
+                self.current.stream_url,
+                executable=FFMPEG_PATH or "ffmpeg",
+                before_options=FFMPEG_BEFORE_OPTS,
+                options=FFMPEG_OPTS,
+            )
+            self.voice.play(source, after=self._after_play)
+        except Exception as e:
+            print(f"[music guild={self.guild_id}] play failed: {e}")
+            self.current = None
+            asyncio.create_task(self._advance())
+            return
+
+        self._cancel_idle_disconnect()
+        await self._announce_now_playing()
+
+    def _after_play(self, error: Exception | None) -> None:
+        # Called from a non-async thread by discord.py's audio player.
+        if error:
+            print(f"[music guild={self.guild_id}] ffmpeg error: {error}")
+        try:
+            asyncio.run_coroutine_threadsafe(self._advance(), bot.loop)
+        except Exception as e:
+            print(f"[music guild={self.guild_id}] advance scheduling failed: {e}")
+
+    async def _announce_now_playing(self) -> None:
+        if not self.current or not self.last_text_channel_id:
+            return
+        channel = bot.get_channel(self.last_text_channel_id)
+        if channel is None:
+            return
+        try:
+            await channel.send(
+                f"▶ Now playing {self.current.display()} "
+                f"— requested by **{self.current.requester_name}**"
+            )
+        except discord.HTTPException:
+            pass
+
+    # ---- control ----
+
+    async def skip(self) -> Track | None:
+        skipped = self.current
+        if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
+            self.voice.stop()  # triggers _after_play -> _advance
+        return skipped
+
+    async def stop_and_clear(self) -> None:
+        async with self._lock:
+            self.queue.clear()
+            self.current = None
+        if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
+            self.voice.stop()
+        self._schedule_idle_disconnect()
+
+    async def leave(self) -> None:
+        self._cancel_idle_disconnect()
+        async with self._lock:
+            self.queue.clear()
+            self.current = None
+        if self.voice:
+            try:
+                await self.voice.disconnect(force=False)
+            except Exception:
+                pass
+            self.voice = None
+
+    # ---- idle disconnect ----
+
+    def _schedule_idle_disconnect(self) -> None:
+        self._cancel_idle_disconnect()
+        self._idle_task = bot.loop.create_task(self._idle_disconnect())
+
+    def _cancel_idle_disconnect(self) -> None:
+        if self._idle_task and not self._idle_task.done():
+            self._idle_task.cancel()
+        self._idle_task = None
+
+    async def _idle_disconnect(self) -> None:
+        try:
+            await asyncio.sleep(MUSIC_IDLE_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        if not self.is_active() and not self.queue:
+            print(f"[music guild={self.guild_id}] idle {MUSIC_IDLE_TIMEOUT}s — disconnecting")
+            await self.leave()
+
+
+guild_music: dict[int, GuildMusic] = {}
+
+
+def get_or_create_music(guild_id: int) -> GuildMusic:
+    if guild_id not in guild_music:
+        guild_music[guild_id] = GuildMusic(guild_id)
+    return guild_music[guild_id]
+
+
+async def resolve_track(query: str, requester: discord.Member) -> Track | None:
+    """Run yt-dlp in a worker thread; return a Track or None on failure."""
+    if not YTDLP_AVAILABLE:
+        return None
+
+    def _extract():
+        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+            return ydl.extract_info(query, download=False)
+
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(_extract), timeout=MUSIC_SEARCH_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        print(f"[music] yt-dlp timeout for query={query!r}")
+        return None
+    except Exception as e:
+        print(f"[music] yt-dlp failed for query={query!r}: {e}")
+        return None
+
+    if not info:
+        return None
+    # Search returns a playlist-shaped dict; pick the first entry.
+    if info.get("_type") == "playlist" or "entries" in info:
+        entries = [e for e in (info.get("entries") or []) if e]
+        if not entries:
+            return None
+        info = entries[0]
+
+    stream_url = info.get("url")
+    if not stream_url:
+        return None
+
+    return Track(
+        stream_url=stream_url,
+        webpage_url=info.get("webpage_url") or info.get("original_url") or query,
+        title=info.get("title") or "(untitled)",
+        duration=int(info["duration"]) if info.get("duration") else None,
+        requester_id=requester.id,
+        requester_name=requester.display_name,
+    )
+
+
+def _music_unavailable_msg() -> str:
+    missing = []
+    if not FFMPEG_AVAILABLE:
+        missing.append("`ffmpeg` (system binary not on PATH)")
+    if not YTDLP_AVAILABLE:
+        missing.append("`yt-dlp` (pip install yt-dlp)")
+    return (
+        "Music playback isn't available on this host: missing "
+        + " and ".join(missing)
+        + ". Tell whoever runs me."
+    )
+
+
+def _user_voice_channel(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member):
+        return None
+    voice = interaction.user.voice
+    return voice.channel if voice else None
 
 
 # ---------- Slash commands ----------
@@ -1874,6 +2160,178 @@ async def status_cmd(interaction: discord.Interaction):
             f"{len(sticker_map)} stickers "
             f"(of {len(interaction.guild.stickers)} total)"
         )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@tree.command(name="play", description="Play a track from YouTube (URL or search query).")
+@app_commands.describe(query="A YouTube URL or search terms")
+async def play_cmd(interaction: discord.Interaction, query: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    if not MUSIC_AVAILABLE:
+        await interaction.response.send_message(_music_unavailable_msg(), ephemeral=True)
+        return
+
+    channel = _user_voice_channel(interaction)
+    if channel is None:
+        await interaction.response.send_message(
+            "Get into a voice channel first.", ephemeral=True
+        )
+        return
+
+    perms = channel.permissions_for(interaction.guild.me)
+    if not perms.connect or not perms.speak:
+        await interaction.response.send_message(
+            f"I'm missing **Connect** or **Speak** permission in {channel.mention}.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+
+    music = get_or_create_music(interaction.guild.id)
+    music.last_text_channel_id = interaction.channel.id
+
+    try:
+        await music.ensure_voice(channel)
+    except discord.ClientException as e:
+        await interaction.followup.send(f"Voice connection failed: {e}", ephemeral=True)
+        return
+    except asyncio.TimeoutError:
+        await interaction.followup.send("Voice connection timed out.", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.followup.send(
+            f"Voice connection error: {type(e).__name__}: {e}", ephemeral=True
+        )
+        return
+
+    if len(music.queue) >= MUSIC_MAX_QUEUE:
+        await interaction.followup.send(
+            f"Queue is full ({MUSIC_MAX_QUEUE} tracks). Skip or stop first.",
+            ephemeral=True,
+        )
+        return
+
+    track = await resolve_track(query, interaction.user)
+    if track is None:
+        await interaction.followup.send(
+            f"Couldn't find anything for `{query[:200]}`. "
+            f"Try a YouTube URL or different search terms.",
+            ephemeral=True,
+        )
+        return
+
+    started_immediately = (music.current is None) and not music.is_active()
+    position = await music.enqueue(track)
+    if started_immediately:
+        await interaction.followup.send(f"▶ Playing {track.display()}.")
+    else:
+        await interaction.followup.send(f"➕ Queued **#{position}**: {track.display()}.")
+
+
+@tree.command(name="pause", description="Pause the current track.")
+async def pause_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or not music.is_playing():
+        await interaction.response.send_message("Nothing playing.", ephemeral=True)
+        return
+    music.voice.pause()
+    await interaction.response.send_message("⏸ Paused.")
+
+
+@tree.command(name="resume", description="Resume a paused track.")
+async def resume_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or not music.is_paused():
+        await interaction.response.send_message("Nothing paused.", ephemeral=True)
+        return
+    music.voice.resume()
+    await interaction.response.send_message("▶ Resumed.")
+
+
+@tree.command(name="skip", description="Skip the current track.")
+async def skip_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or not music.is_active():
+        await interaction.response.send_message("Nothing playing.", ephemeral=True)
+        return
+    skipped = await music.skip()
+    title = skipped.title if skipped else "current track"
+    await interaction.response.send_message(f"⏭ Skipped **{title}**.")
+
+
+@tree.command(name="stop", description="Clear the queue and stop playback.")
+async def stop_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or (not music.is_active() and not music.queue and not music.current):
+        await interaction.response.send_message("Nothing playing.", ephemeral=True)
+        return
+    await music.stop_and_clear()
+    await interaction.response.send_message("⏹ Stopped and cleared queue.")
+
+
+@tree.command(name="leave", description="Disconnect from voice.")
+async def leave_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or music.voice is None or not music.voice.is_connected():
+        await interaction.response.send_message("Not in a voice channel.", ephemeral=True)
+        return
+    await music.leave()
+    await interaction.response.send_message("👋 Left voice.")
+
+
+@tree.command(name="nowplaying", description="Show the currently playing track.")
+async def nowplaying_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or music.current is None:
+        await interaction.response.send_message("Nothing playing.", ephemeral=True)
+        return
+    state = "⏸ Paused" if music.is_paused() else "▶ Playing"
+    await interaction.response.send_message(
+        f"{state}: {music.current.display()} — requested by **{music.current.requester_name}**",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="queue", description="Show the current music queue.")
+async def queue_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or (not music.current and not music.queue):
+        await interaction.response.send_message("Queue is empty.", ephemeral=True)
+        return
+    lines: list[str] = []
+    if music.current:
+        marker = "⏸" if music.is_paused() else "▶"
+        lines.append(f"{marker} **Now:** {music.current.display()}")
+    if music.queue:
+        lines.append(f"\n**Up next** ({len(music.queue)}):")
+        for i, t in enumerate(list(music.queue)[:10], 1):
+            lines.append(f"`{i:2d}.` {t.display()}")
+        if len(music.queue) > 10:
+            lines.append(f"_…and {len(music.queue) - 10} more_")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
