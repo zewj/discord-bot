@@ -106,7 +106,7 @@ python bot.py
 | `/mood`   | Switch personality preset (`escalating` / `feral` / `villain` / `chill` / `tsundere`) — scope `server` or `here` |
 | `/rage`   | Show the current patience meter for this conversation (with bar + tier) |
 | `/status` | Show model, mood, memory, scope, active conversation count      |
-| `/play`   | Join your voice channel and queue a track from YouTube (URL or search) |
+| `/play`   | Join your voice channel and queue a track from YouTube/SoundCloud/Spotify/Apple Music (URL or search) |
 | `/pause`  | Pause the current track                                         |
 | `/resume` | Resume a paused track                                           |
 | `/skip`   | Skip to the next track in the queue                             |
@@ -114,6 +114,12 @@ python bot.py
 | `/queue`  | Show what's queued                                              |
 | `/nowplaying` | Show what's playing right now                               |
 | `/leave`  | Disconnect from voice                                           |
+| `/loop`   | Loop the current track, the queue, or turn looping off          |
+| `/shuffle`| Shuffle the queue                                               |
+| `/volume` | Set playback volume 0-200% (default 100)                        |
+| `/remove` | Remove a track from the queue by position                       |
+| `/clear`  | Clear the queue but keep the current track playing              |
+| `/jump`   | Skip ahead to a specific queue position                         |
 
 `/mood` accepts a `scope` arg:
 - `server` (default) — applies to the whole guild (requires Manage Channels)

@@ -1681,6 +1681,12 @@ class GuildMusic:
         # elapsed time accrued before pauses so resume picks up cleanly.
         self._started_at: float | None = None
         self._accumulated: float = 0.0
+        # Playback modes
+        self.loop_mode: str = "off"        # "off" | "track" | "queue"
+        self.volume: float = 1.0           # PCMVolumeTransformer multiplier, 0.0-2.0
+        # Set by skip()/jump() so the next _advance bypasses loop_mode for that
+        # single transition (user explicitly wants to move forward, not loop).
+        self._force_advance: bool = False
 
     # ---- state queries ----
 
@@ -1754,12 +1760,34 @@ class GuildMusic:
         return position
 
     async def _advance(self, announce: bool = True) -> None:
+        bypass_loop = self._force_advance
+        self._force_advance = False
+
+        # Decide which track to play next. With loop=track, the same track
+        # replays. With loop=queue, the just-played track goes back to the
+        # end of the queue. bypass_loop (from skip/jump) ignores both.
+        is_replay = (
+            not bypass_loop
+            and self.loop_mode == "track"
+            and self.current is not None
+        )
+
         async with self._lock:
-            if not self.queue:
-                self.current = None
-                self._schedule_idle_disconnect()
-                return
-            self.current = self.queue.popleft()
+            if is_replay:
+                next_track = self.current
+            else:
+                if (
+                    not bypass_loop
+                    and self.loop_mode == "queue"
+                    and self.current is not None
+                ):
+                    self.queue.append(self.current)
+                if not self.queue:
+                    self.current = None
+                    self._schedule_idle_disconnect()
+                    return
+                next_track = self.queue.popleft()
+                self.current = next_track
 
         if self.voice is None or not self.voice.is_connected():
             self.current = None
@@ -1767,11 +1795,12 @@ class GuildMusic:
 
         try:
             source = discord.FFmpegPCMAudio(
-                self.current.stream_url,
+                next_track.stream_url,
                 executable=FFMPEG_PATH or "ffmpeg",
                 before_options=FFMPEG_BEFORE_OPTS,
                 options=FFMPEG_OPTS,
             )
+            source = discord.PCMVolumeTransformer(source, volume=self.volume)
             self.voice.play(source, after=self._after_play)
         except Exception as e:
             print(f"[music guild={self.guild_id}] play failed: {e}")
@@ -1781,7 +1810,9 @@ class GuildMusic:
 
         self._start_timer()
         self._cancel_idle_disconnect()
-        if announce:
+        # Suppress the auto-announce when looping the same track, otherwise the
+        # channel fills up with identical embeds.
+        if announce and not is_replay:
             await self._announce_now_playing()
 
     def _after_play(self, error: Exception | None) -> None:
@@ -1802,7 +1833,13 @@ class GuildMusic:
         try:
             # Auto-announce fires the moment a track starts → elapsed ≈ 0.
             await channel.send(
-                embed=_track_embed(self.current, "🎵 Now Playing", elapsed=0.0),
+                embed=_track_embed(
+                    self.current,
+                    "🎵 Now Playing",
+                    elapsed=0.0,
+                    loop_mode=self.loop_mode,
+                    volume_pct=int(round(self.volume * 100)),
+                ),
                 view=MusicControls(),
             )
         except discord.HTTPException:
@@ -1812,6 +1849,9 @@ class GuildMusic:
 
     async def skip(self) -> Track | None:
         skipped = self.current
+        # User explicitly wants to move forward — bypass loop_mode for this
+        # one transition so loop=track doesn't replay the same song.
+        self._force_advance = True
         if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
             self.voice.stop()  # triggers _after_play -> _advance
         return skipped
@@ -1847,6 +1887,72 @@ class GuildMusic:
             except Exception:
                 pass
             self.voice = None
+
+    # ---- playback modes / queue manipulation ----
+
+    def set_loop(self, mode: str) -> str:
+        """Set loop mode to one of 'off', 'track', 'queue'. Returns the resolved mode."""
+        if mode not in ("off", "track", "queue"):
+            mode = "off"
+        self.loop_mode = mode
+        return mode
+
+    def cycle_loop(self) -> str:
+        """Cycle off → track → queue → off. Returns the new mode."""
+        nxt = {"off": "track", "track": "queue", "queue": "off"}
+        self.loop_mode = nxt.get(self.loop_mode, "off")
+        return self.loop_mode
+
+    def set_volume(self, level_pct: int) -> int:
+        """Set volume as a percentage (0-200). Applies live to current playback
+        if there's an active PCMVolumeTransformer. Returns the clamped value."""
+        level_pct = max(0, min(200, int(level_pct)))
+        self.volume = level_pct / 100.0
+        if self.voice and isinstance(self.voice.source, discord.PCMVolumeTransformer):
+            self.voice.source.volume = self.volume
+        return level_pct
+
+    async def shuffle(self) -> int:
+        """Randomize queue order. Returns count of tracks shuffled."""
+        async with self._lock:
+            count = len(self.queue)
+            if count >= 2:
+                items = list(self.queue)
+                random.shuffle(items)
+                self.queue = deque(items)
+        return count
+
+    async def remove_at(self, position: int) -> Track | None:
+        """Remove a track at 1-indexed queue position. None if out of range."""
+        async with self._lock:
+            if position < 1 or position > len(self.queue):
+                return None
+            items = list(self.queue)
+            removed = items.pop(position - 1)
+            self.queue = deque(items)
+        return removed
+
+    async def clear_queue(self) -> int:
+        """Empty the queue but keep the current track playing. Returns count cleared."""
+        async with self._lock:
+            count = len(self.queue)
+            self.queue.clear()
+        return count
+
+    async def jump_to(self, position: int) -> Track | None:
+        """Skip ahead to the 1-indexed position in the queue, discarding the
+        tracks in between. Returns the track that will start playing, or None
+        if position is out of range."""
+        async with self._lock:
+            if position < 1 or position > len(self.queue):
+                return None
+            for _ in range(position - 1):
+                self.queue.popleft()
+            target = self.queue[0]
+        self._force_advance = True
+        if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
+            self.voice.stop()
+        return target
 
     # ---- idle disconnect ----
 
@@ -2121,6 +2227,8 @@ def _track_embed(
     position: int | None = None,
     elapsed: float = 0.0,
     paused: bool = False,
+    loop_mode: str = "off",
+    volume_pct: int | None = None,
 ) -> discord.Embed:
     """Rythm-style track embed: author/header, hyperlinked title, uploader,
     progress bar with time stamps, thumbnail, and a requester footer."""
@@ -2129,7 +2237,16 @@ def _track_embed(
         url=track.webpage_url,
         color=MUSIC_EMBED_COLOR,
     )
-    embed.set_author(name=("⏸ Paused" if paused else header))
+    # Header icon reflects pause state first, then loop mode.
+    if paused:
+        author = "⏸ Paused"
+    elif loop_mode == "track":
+        author = "🔂 Now Playing"
+    elif loop_mode == "queue":
+        author = "🔁 Now Playing"
+    else:
+        author = header
+    embed.set_author(name=author)
 
     desc_parts: list[str] = []
     if track.uploader:
@@ -2153,6 +2270,8 @@ def _track_embed(
     footer_parts.append(f"Requested by {track.requester_name}")
     if track.source_label and track.source_label != "YouTube":
         footer_parts.append(f"via {track.source_label}")
+    if volume_pct is not None and volume_pct != 100:
+        footer_parts.append(f"🔊 {volume_pct}%")
     embed.set_footer(text=" • ".join(footer_parts))
     return embed
 
@@ -2177,7 +2296,7 @@ class MusicControls(discord.ui.View):
             return None
         return guild_music.get(interaction.guild_id)
 
-    @discord.ui.button(emoji="⏮", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(emoji="⏮", style=discord.ButtonStyle.secondary, row=0)
     async def rewind_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
@@ -2192,7 +2311,7 @@ class MusicControls(discord.ui.View):
             f"⏮ Restarted **{track.title if track else 'track'}**.", ephemeral=True
         )
 
-    @discord.ui.button(emoji="⏯", style=discord.ButtonStyle.primary)
+    @discord.ui.button(emoji="⏯", style=discord.ButtonStyle.primary, row=0)
     async def pause_resume_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
@@ -2206,7 +2325,7 @@ class MusicControls(discord.ui.View):
         else:
             await interaction.response.send_message("Nothing playing.", ephemeral=True)
 
-    @discord.ui.button(emoji="⏭", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(emoji="⏭", style=discord.ButtonStyle.secondary, row=0)
     async def skip_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
@@ -2220,7 +2339,7 @@ class MusicControls(discord.ui.View):
         title = skipped.title if skipped else "track"
         await interaction.response.send_message(f"⏭ Skipped **{title}**.", ephemeral=True)
 
-    @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger)
+    @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger, row=0)
     async def stop_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
@@ -2232,6 +2351,34 @@ class MusicControls(discord.ui.View):
             return
         await music.stop_and_clear()
         await interaction.response.send_message("⏹ Stopped.", ephemeral=True)
+
+    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
+    async def loop_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        music = await self._music(interaction)
+        if music is None:
+            return
+        new_mode = music.cycle_loop()
+        labels = {"off": "Loop **off**", "track": "Looping **this track** 🔂", "queue": "Looping **the queue** 🔁"}
+        await interaction.response.send_message(labels[new_mode], ephemeral=True)
+
+    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=1)
+    async def shuffle_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        music = await self._music(interaction)
+        if music is None:
+            return
+        count = await music.shuffle()
+        if count < 2:
+            await interaction.response.send_message(
+                "Need at least 2 queued tracks to shuffle.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"🔀 Shuffled **{count}** tracks.", ephemeral=True
+            )
 
 
 def _music_unavailable_msg() -> str:
@@ -2630,7 +2777,13 @@ async def play_cmd(interaction: discord.Interaction, query: str):
     position = await music.enqueue(track)
     if started_immediately:
         await interaction.followup.send(
-            embed=_track_embed(track, "🎵 Now Playing", elapsed=0.0),
+            embed=_track_embed(
+                track,
+                "🎵 Now Playing",
+                elapsed=0.0,
+                loop_mode=music.loop_mode,
+                volume_pct=int(round(music.volume * 100)),
+            ),
             view=MusicControls(),
         )
     else:
@@ -2718,6 +2871,8 @@ async def nowplaying_cmd(interaction: discord.Interaction):
             "🎵 Now Playing",
             elapsed=music.elapsed(),
             paused=music.is_paused(),
+            loop_mode=music.loop_mode,
+            volume_pct=int(round(music.volume * 100)),
         ),
         view=MusicControls(),
         ephemeral=True,
@@ -2753,6 +2908,119 @@ async def queue_cmd(interaction: discord.Interaction):
             inline=False,
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="loop", description="Loop the current track, the queue, or turn looping off.")
+@app_commands.describe(mode="What to loop")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="off (default)", value="off"),
+    app_commands.Choice(name="track (repeat current song)", value="track"),
+    app_commands.Choice(name="queue (cycle through queue)", value="queue"),
+])
+async def loop_cmd(
+    interaction: discord.Interaction, mode: app_commands.Choice[str]
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = get_or_create_music(interaction.guild.id)
+    resolved = music.set_loop(mode.value)
+    labels = {
+        "off":   "Loop **off**.",
+        "track": "🔂 Looping **this track**.",
+        "queue": "🔁 Looping **the queue**.",
+    }
+    await interaction.response.send_message(labels[resolved])
+
+
+@tree.command(name="shuffle", description="Shuffle the current queue (does not affect what's playing now).")
+async def shuffle_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or len(music.queue) < 2:
+        await interaction.response.send_message(
+            "Need at least 2 queued tracks to shuffle.", ephemeral=True
+        )
+        return
+    count = await music.shuffle()
+    await interaction.response.send_message(f"🔀 Shuffled **{count}** tracks.")
+
+
+@tree.command(name="volume", description="Set playback volume (0-200, default 100).")
+@app_commands.describe(level="Volume percent, 0 to 200")
+async def volume_cmd(interaction: discord.Interaction, level: int):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    if level < 0 or level > 200:
+        await interaction.response.send_message(
+            "Volume must be between 0 and 200.", ephemeral=True
+        )
+        return
+    music = get_or_create_music(interaction.guild.id)
+    new_level = music.set_volume(level)
+    if new_level == 0:
+        await interaction.response.send_message("🔇 Muted.")
+    elif new_level <= 33:
+        await interaction.response.send_message(f"🔈 Volume **{new_level}%**.")
+    elif new_level <= 100:
+        await interaction.response.send_message(f"🔉 Volume **{new_level}%**.")
+    else:
+        await interaction.response.send_message(f"🔊 Volume **{new_level}%** (boosted).")
+
+
+@tree.command(name="remove", description="Remove a track from the queue by position.")
+@app_commands.describe(position="1-indexed position of the track in the queue")
+async def remove_cmd(interaction: discord.Interaction, position: int):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or not music.queue:
+        await interaction.response.send_message("Queue is empty.", ephemeral=True)
+        return
+    removed = await music.remove_at(position)
+    if removed is None:
+        await interaction.response.send_message(
+            f"No track at position **#{position}** (queue has {len(music.queue) + 1} tracks).",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(f"🗑 Removed **{removed.title}** from the queue.")
+
+
+@tree.command(name="clear", description="Clear the queue without stopping the current track.")
+async def clear_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or not music.queue:
+        await interaction.response.send_message("Queue is already empty.", ephemeral=True)
+        return
+    count = await music.clear_queue()
+    await interaction.response.send_message(f"🧹 Cleared **{count}** tracks from the queue.")
+
+
+@tree.command(name="jump", description="Skip ahead to a specific position in the queue.")
+@app_commands.describe(position="1-indexed position to jump to (discards everything before it)")
+async def jump_cmd(interaction: discord.Interaction, position: int):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or not music.queue:
+        await interaction.response.send_message("Queue is empty.", ephemeral=True)
+        return
+    target = await music.jump_to(position)
+    if target is None:
+        await interaction.response.send_message(
+            f"No track at position **#{position}**.", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(f"⏩ Jumping to **{target.title}**.")
 
 
 def _shutdown_flush():
