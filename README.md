@@ -49,7 +49,18 @@ Required by the `/play` voice commands. Without it, the music commands log a cle
 
 The Python side (`yt-dlp`) is installed automatically via `requirements.txt`.
 
-### 6. Install and run
+### 6. (Optional) Spotify credentials for Spotify-link parsing
+
+Without these, `/play` still works for YouTube, SoundCloud, and Apple Music URLs — but pasting a Spotify link returns "couldn't resolve". With them, Spotify URLs are converted to a `"Title Artist"` YouTube search and played from there (Spotify's API doesn't expose audio streams, so this is the only legal route).
+
+1. Go to https://developer.spotify.com/dashboard, log in, **Create app**
+2. Any name/description; redirect URI doesn't matter — leave it as `http://localhost`
+3. Open the app → **Settings** → copy **Client ID** and **Client secret**
+4. Set them as `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`
+
+Apple Music link parsing needs no credentials — uses the free iTunes Search API.
+
+### 7. Install and run
 
 ```powershell
 cd C:\Users\Neko\Desktop\discord-bot
@@ -61,6 +72,8 @@ $env:DISCORD_TOKEN = "your_discord_bot_token_here"
 $env:ANTHROPIC_API_KEY = "your_anthropic_api_key_here"
 $env:GIPHY_API_KEY = "your_giphy_api_key_here"   # optional — enables reaction GIFs
 $env:YOUTUBE_API_KEY = "your_youtube_api_key_here"  # optional — enables video links
+$env:SPOTIFY_CLIENT_ID = "your_spotify_client_id"          # optional — Spotify link parsing
+$env:SPOTIFY_CLIENT_SECRET = "your_spotify_client_secret"  # optional — Spotify link parsing
 
 python bot.py
 ```
@@ -75,7 +88,12 @@ python bot.py
 - **Videos (out)**: with `YOUTUBE_API_KEY` set, the bot can search YouTube and post videos via the `send_video` tool — Discord auto-embeds the URL as an inline player
 - **Custom emojis (in & out)**: the bot reads custom server emojis users send and uses them inline in its own replies (`:emoji_name:` syntax — auto-rewritten to the rendered form before sending). Up to 40 emojis per server are exposed to Claude; if your server has more, only the alphabetically-first 40 are listed
 - **Server stickers (in & out)**: the bot can read user-sent stickers (notes them in conversation context) and post stickers itself via the `send_sticker` tool. Up to 25 stickers per server are exposed; max 3 per outgoing message (Discord's hard limit)
-- **Music playback**: if `ffmpeg` is installed on the host, the bot joins your voice channel and streams audio. Join a voice channel, then run `/play <YouTube URL or search>`. Source: YouTube (via `yt-dlp`). Auto-disconnects after 5 minutes idle
+- **Music playback**: if `ffmpeg` is installed on the host, the bot joins your voice channel and streams audio. Join a voice channel, then run `/play <URL or search>`. Sources:
+  - **YouTube** — URL or plain search text (default)
+  - **SoundCloud** — paste a SoundCloud URL (handled natively by `yt-dlp`)
+  - **Spotify** — paste a track URL/URI (`open.spotify.com/track/…` or `spotify:track:…`); requires `SPOTIFY_CLIENT_ID` + `SPOTIFY_CLIENT_SECRET`. Spotify doesn't stream audio via its API, so the bot reads track metadata and plays the equivalent from YouTube
+  - **Apple Music** — paste a single-track URL (`music.apple.com/…?i=…`); no credentials needed (uses iTunes Search API). Albums aren't supported yet
+  - Auto-disconnects after 5 minutes idle
 
 ## Slash commands
 

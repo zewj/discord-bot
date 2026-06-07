@@ -118,6 +118,12 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GIPHY_API_KEY = os.environ.get("GIPHY_API_KEY")
 # Optional. Without it, the send_video (YouTube) tool is disabled.
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
+# Optional. Without these, /play still works for YouTube/SoundCloud, but
+# Spotify URLs will fail to resolve. Free credentials from
+# https://developer.spotify.com/dashboard. No user OAuth needed — we only
+# read public track metadata via the Client Credentials flow.
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
 
 # ---------- Config ----------
 
@@ -1549,7 +1555,11 @@ async def on_ready():
     if YOUTUBE_API_KEY: media.append("videos(youtube)")
     media.append("emojis+stickers(per-server)")
     if MUSIC_AVAILABLE:
-        media.append("music(voice+yt-dlp)")
+        sources = ["YouTube", "SoundCloud"]
+        if SPOTIFY_AVAILABLE:
+            sources.append("Spotify")
+        sources.append("AppleMusic")
+        media.append(f"music({'/'.join(sources)})")
     print(f"  media tools: {', '.join(media)}")
     if not MUSIC_AVAILABLE:
         missing = []
@@ -1640,6 +1650,7 @@ class Track:
     requester_name: str
     thumbnail_url: str | None = None
     uploader: str | None = None        # e.g. "Rick Astley" — YouTube channel name
+    source_label: str = "YouTube"      # for embed attribution (Spotify, Apple Music, SoundCloud)
 
     def duration_str(self) -> str:
         if not self.duration:
@@ -1867,24 +1878,189 @@ def get_or_create_music(guild_id: int) -> GuildMusic:
     return guild_music[guild_id]
 
 
+# ---- Alternate source resolvers (Spotify, Apple Music) ----
+#
+# Neither Spotify nor Apple Music exposes audio streams via their public APIs
+# (copyright). So when /play receives one of their URLs we read the track
+# metadata (title + artist), then search YouTube for a match and play THAT.
+# SoundCloud is different — yt-dlp handles SoundCloud URLs natively, so they
+# work without any extra logic; we just detect them for embed branding.
+
+SPOTIFY_AVAILABLE = bool(SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET)
+
+SPOTIFY_URL_RE = re.compile(
+    r"(?:open\.spotify\.com/(?:intl-\w+/)?track/|spotify:track:)([a-zA-Z0-9]+)"
+)
+APPLE_MUSIC_TRACK_ID_RE = re.compile(r"music\.apple\.com/.+[?&]i=(\d+)")
+APPLE_MUSIC_SONG_RE = re.compile(r"music\.apple\.com/[^/]+/song/[^/]+/(\d+)")
+
+# Cache the Client Credentials token until just before it expires.
+_spotify_token: str | None = None
+_spotify_token_expires_at: float = 0.0
+
+
+def _is_spotify_url(query: str) -> bool:
+    q = query.lower()
+    return "open.spotify.com" in q or q.startswith("spotify:")
+
+
+def _is_apple_music_url(query: str) -> bool:
+    return "music.apple.com" in query.lower()
+
+
+def _is_soundcloud_url(query: str) -> bool:
+    return "soundcloud.com" in query.lower()
+
+
+async def _get_spotify_token() -> str | None:
+    global _spotify_token, _spotify_token_expires_at
+    if not SPOTIFY_AVAILABLE:
+        return None
+    if _spotify_token and time.time() < _spotify_token_expires_at - 60:
+        return _spotify_token
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://accounts.spotify.com/api/token",
+                auth=aiohttp.BasicAuth(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
+                data={"grant_type": "client_credentials"},
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[spotify] auth HTTP {resp.status}")
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        print(f"[spotify] auth failed: {e}")
+        return None
+    _spotify_token = data.get("access_token")
+    _spotify_token_expires_at = time.time() + float(data.get("expires_in", 3600) or 3600)
+    return _spotify_token
+
+
+async def resolve_spotify_track(url: str) -> str | None:
+    """Spotify track URL/URI → 'Title Artist' string for a YouTube search.
+    Returns None if the URL doesn't match, creds aren't set, or the API fails."""
+    match = SPOTIFY_URL_RE.search(url)
+    if not match:
+        return None
+    track_id = match.group(1)
+    token = await _get_spotify_token()
+    if not token:
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"https://api.spotify.com/v1/tracks/{track_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[spotify] track lookup HTTP {resp.status}")
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        print(f"[spotify] track lookup failed: {e}")
+        return None
+    title = (data.get("name") or "").strip()
+    artists = ", ".join(
+        a.get("name", "") for a in (data.get("artists") or []) if a.get("name")
+    )
+    if not title:
+        return None
+    return f"{title} {artists}".strip()
+
+
+async def resolve_apple_music_track(url: str) -> str | None:
+    """Apple Music track URL → 'Title Artist' string for a YouTube search.
+    Uses the free iTunes Search API (no key needed). Album-only URLs (no
+    ?i=… track id) are rejected — we don't enqueue whole albums yet."""
+    track_id = None
+    m = APPLE_MUSIC_TRACK_ID_RE.search(url)
+    if m:
+        track_id = m.group(1)
+    else:
+        m = APPLE_MUSIC_SONG_RE.search(url)
+        if m:
+            track_id = m.group(1)
+    if not track_id:
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"https://itunes.apple.com/lookup?id={track_id}&entity=song"
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[apple-music] lookup HTTP {resp.status}")
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        print(f"[apple-music] lookup failed: {e}")
+        return None
+    results = data.get("results") or []
+    if not results:
+        return None
+    track = results[0]
+    title = (track.get("trackName") or "").strip()
+    artist = (track.get("artistName") or "").strip()
+    if not title:
+        return None
+    return f"{title} {artist}".strip()
+
+
 async def resolve_track(query: str, requester: discord.Member) -> Track | None:
-    """Run yt-dlp in a worker thread; return a Track or None on failure."""
+    """Resolve a query (URL or search text) into a playable Track.
+
+    Routing:
+    - Spotify URL → Spotify API → 'Title Artist' → yt-dlp ytsearch1
+    - Apple Music URL → iTunes Search API → 'Title Artist' → yt-dlp ytsearch1
+    - SoundCloud URL → yt-dlp direct (native support)
+    - YouTube URL → yt-dlp direct
+    - Anything else (plain text) → yt-dlp ytsearch1 (set by YTDL_OPTS default_search)
+    """
     if not YTDLP_AVAILABLE:
         return None
 
+    yt_query = query
+    source_label = "YouTube"
+
+    if _is_spotify_url(query):
+        resolved = await resolve_spotify_track(query)
+        if not resolved:
+            if not SPOTIFY_AVAILABLE:
+                print(f"[music] spotify URL given but SPOTIFY_CLIENT_ID/SECRET not set")
+            else:
+                print(f"[music] spotify resolution failed for {query!r}")
+            return None
+        yt_query = f"ytsearch1:{resolved}"
+        source_label = "Spotify (via YouTube)"
+        print(f"[music] spotify → '{resolved}' → YouTube search")
+    elif _is_apple_music_url(query):
+        resolved = await resolve_apple_music_track(query)
+        if not resolved:
+            print(f"[music] apple music resolution failed for {query!r} "
+                  "(album URLs without ?i= track id aren't supported yet)")
+            return None
+        yt_query = f"ytsearch1:{resolved}"
+        source_label = "Apple Music (via YouTube)"
+        print(f"[music] apple music → '{resolved}' → YouTube search")
+    elif _is_soundcloud_url(query):
+        source_label = "SoundCloud"
+
     def _extract():
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
-            return ydl.extract_info(query, download=False)
+            return ydl.extract_info(yt_query, download=False)
 
     try:
         info = await asyncio.wait_for(
             asyncio.to_thread(_extract), timeout=MUSIC_SEARCH_TIMEOUT
         )
     except asyncio.TimeoutError:
-        print(f"[music] yt-dlp timeout for query={query!r}")
+        print(f"[music] yt-dlp timeout for query={yt_query!r}")
         return None
     except Exception as e:
-        print(f"[music] yt-dlp failed for query={query!r}: {e}")
+        print(f"[music] yt-dlp failed for query={yt_query!r}: {e}")
         return None
 
     if not info:
@@ -1917,6 +2093,7 @@ async def resolve_track(query: str, requester: discord.Member) -> Track | None:
         requester_name=requester.display_name,
         thumbnail_url=thumb_url,
         uploader=info.get("uploader") or info.get("channel") or info.get("creator"),
+        source_label=source_label,
     )
 
 
@@ -1974,6 +2151,8 @@ def _track_embed(
     if position is not None:
         footer_parts.append(f"#{position} in queue")
     footer_parts.append(f"Requested by {track.requester_name}")
+    if track.source_label and track.source_label != "YouTube":
+        footer_parts.append(f"via {track.source_label}")
     embed.set_footer(text=" • ".join(footer_parts))
     return embed
 
@@ -2425,9 +2604,24 @@ async def play_cmd(interaction: discord.Interaction, query: str):
 
     track = await resolve_track(query, interaction.user)
     if track is None:
+        # Tailor the error to the input — Spotify needs creds, Apple Music
+        # only handles single-track URLs, etc.
+        if _is_spotify_url(query) and not SPOTIFY_AVAILABLE:
+            hint = (
+                "Spotify URLs need `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` "
+                "set on the host. Tell whoever runs me, or send a YouTube link instead."
+            )
+        elif _is_spotify_url(query):
+            hint = "Couldn't resolve that Spotify track. Try a YouTube link or search instead."
+        elif _is_apple_music_url(query):
+            hint = (
+                "Couldn't resolve that Apple Music link. Single-track URLs only "
+                "(the kind with `?i=...` at the end). Albums aren't supported yet."
+            )
+        else:
+            hint = "Try a YouTube/SoundCloud URL or different search terms."
         await interaction.followup.send(
-            f"Couldn't find anything for `{query[:200]}`. "
-            f"Try a YouTube URL or different search terms.",
+            f"Couldn't play `{query[:200]}`.\n{hint}",
             ephemeral=True,
         )
         return
