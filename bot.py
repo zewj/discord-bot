@@ -1744,7 +1744,10 @@ class GuildMusic:
         if channel is None:
             return
         try:
-            await channel.send(embed=_track_embed(self.current, "▶ Now Playing"))
+            await channel.send(
+                embed=_track_embed(self.current, "▶ Now Playing"),
+                view=MusicControls(),
+            )
         except discord.HTTPException:
             pass
 
@@ -1755,6 +1758,18 @@ class GuildMusic:
         if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
             self.voice.stop()  # triggers _after_play -> _advance
         return skipped
+
+    async def restart_current(self) -> Track | None:
+        """Re-queue the current track at the front, then stop playback so
+        _after_play -> _advance picks it back up from the beginning."""
+        if self.current is None:
+            return None
+        track = self.current
+        async with self._lock:
+            self.queue.appendleft(track)
+        if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
+            self.voice.stop()
+        return track
 
     async def stop_and_clear(self) -> None:
         async with self._lock:
@@ -1858,22 +1873,100 @@ async def resolve_track(query: str, requester: discord.Member) -> Track | None:
     )
 
 
-def _track_embed(track: Track, title: str, position: int | None = None) -> discord.Embed:
-    """Build a Discord embed for a single track (play / queued / now playing)."""
+def _track_embed(track: Track, title: str = "▶ Now Playing", position: int | None = None) -> discord.Embed:
+    """Minimal track embed: just the linked title + a small footer."""
     embed = discord.Embed(
-        title=title,
-        description=f"[{track.title}]({track.webpage_url})",
+        description=f"**{title}**\n[{track.title}]({track.webpage_url})",
         color=MUSIC_EMBED_COLOR,
     )
-    if track.thumbnail_url:
-        embed.set_thumbnail(url=track.thumbnail_url)
+    footer_parts = []
     duration = track.duration_str().strip(" ()")
     if duration:
-        embed.add_field(name="Duration", value=duration, inline=True)
-    embed.add_field(name="Requested by", value=track.requester_name, inline=True)
+        footer_parts.append(duration)
     if position is not None:
-        embed.add_field(name="Position", value=f"#{position}", inline=True)
+        footer_parts.append(f"queue #{position}")
+    footer_parts.append(f"requested by {track.requester_name}")
+    embed.set_footer(text=" • ".join(footer_parts))
     return embed
+
+
+class MusicControls(discord.ui.View):
+    """⏮  ⏯  ⏭  ⏹ — control buttons attached to "now playing" embeds.
+
+    Stateless: every callback resolves the GuildMusic via interaction.guild_id,
+    so buttons on old embeds still operate on whatever's currently playing
+    (which is what users expect — clicking "skip" on a stale embed skips the
+    track that's playing right now, not a track that ended hours ago).
+    """
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _music(self, interaction: discord.Interaction) -> GuildMusic | None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Music only works in servers.", ephemeral=True
+            )
+            return None
+        return guild_music.get(interaction.guild_id)
+
+    @discord.ui.button(emoji="⏮", style=discord.ButtonStyle.secondary)
+    async def rewind_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        music = await self._music(interaction)
+        if music is None:
+            return
+        if music.current is None:
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        track = await music.restart_current()
+        await interaction.response.send_message(
+            f"⏮ Restarted **{track.title if track else 'track'}**.", ephemeral=True
+        )
+
+    @discord.ui.button(emoji="⏯", style=discord.ButtonStyle.primary)
+    async def pause_resume_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        music = await self._music(interaction)
+        if music is None:
+            return
+        if music.is_playing():
+            music.voice.pause()
+            await interaction.response.send_message("⏸ Paused.", ephemeral=True)
+        elif music.is_paused():
+            music.voice.resume()
+            await interaction.response.send_message("▶ Resumed.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+
+    @discord.ui.button(emoji="⏭", style=discord.ButtonStyle.secondary)
+    async def skip_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        music = await self._music(interaction)
+        if music is None:
+            return
+        if not music.is_active():
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        skipped = await music.skip()
+        title = skipped.title if skipped else "track"
+        await interaction.response.send_message(f"⏭ Skipped **{title}**.", ephemeral=True)
+
+    @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger)
+    async def stop_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        music = await self._music(interaction)
+        if music is None:
+            return
+        if not music.is_active() and not music.queue and not music.current:
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        await music.stop_and_clear()
+        await interaction.response.send_message("⏹ Stopped.", ephemeral=True)
 
 
 def _music_unavailable_msg() -> str:
@@ -2256,7 +2349,10 @@ async def play_cmd(interaction: discord.Interaction, query: str):
     started_immediately = (music.current is None) and not music.is_active()
     position = await music.enqueue(track)
     if started_immediately:
-        await interaction.followup.send(embed=_track_embed(track, "▶ Now Playing"))
+        await interaction.followup.send(
+            embed=_track_embed(track, "▶ Now Playing"),
+            view=MusicControls(),
+        )
     else:
         await interaction.followup.send(
             embed=_track_embed(track, "➕ Queued", position=position)
@@ -2340,7 +2436,9 @@ async def nowplaying_cmd(interaction: discord.Interaction):
         return
     title = "⏸ Paused" if music.is_paused() else "▶ Now Playing"
     await interaction.response.send_message(
-        embed=_track_embed(music.current, title), ephemeral=True
+        embed=_track_embed(music.current, title),
+        view=MusicControls(),
+        ephemeral=True,
     )
 
 
