@@ -90,9 +90,11 @@ python bot.py
 - **Server stickers (in & out)**: the bot can read user-sent stickers (notes them in conversation context) and post stickers itself via the `send_sticker` tool. Up to 25 stickers per server are exposed; max 3 per outgoing message (Discord's hard limit)
 - **Music playback**: if `ffmpeg` is installed on the host, the bot joins your voice channel and streams audio. Join a voice channel, then run `/play <URL or search>`. Sources:
   - **YouTube** — URL or plain search text (default)
-  - **SoundCloud** — paste a SoundCloud URL (handled natively by `yt-dlp`)
+  - **SoundCloud** — paste a track URL (handled natively by `yt-dlp`)
   - **Spotify** — paste a track URL/URI (`open.spotify.com/track/…` or `spotify:track:…`); requires `SPOTIFY_CLIENT_ID` + `SPOTIFY_CLIENT_SECRET`. Spotify doesn't stream audio via its API, so the bot reads track metadata and plays the equivalent from YouTube
-  - **Apple Music** — paste a single-track URL (`music.apple.com/…?i=…`); no credentials needed (uses iTunes Search API). Albums aren't supported yet
+  - **Apple Music** — paste a single-track URL (`music.apple.com/…?i=…`); no credentials needed (uses iTunes Search API)
+  - **Playlists & albums** — paste a YouTube playlist, SoundCloud set, Spotify playlist/album, or Apple Music album URL to queue all of it at once (capped at 50 tracks). Playlist tracks resolve lazily — each one's stream is fetched just before it plays, so big queues start instantly and stream URLs never go stale. (Apple Music *curated playlists* aren't supported — not exposed by the iTunes API — but albums are.)
+  - **Now-playing embed** has a **live progress bar** that updates as the track plays, plus ⏮ ⏯ ⏭ ⏹ / 🔁 🔀 buttons
   - Auto-disconnects after 5 minutes idle
 
 ## Slash commands
@@ -106,7 +108,7 @@ python bot.py
 | `/mood`   | Switch personality preset (`escalating` / `feral` / `villain` / `chill` / `tsundere`) — scope `server` or `here` |
 | `/rage`   | Show the current patience meter for this conversation (with bar + tier) |
 | `/status` | Show model, mood, memory, scope, active conversation count      |
-| `/play`   | Join your voice channel and queue a track from YouTube/SoundCloud/Spotify/Apple Music (URL or search) |
+| `/play`   | Join voice and queue a track **or playlist/album** from YouTube/SoundCloud/Spotify/Apple Music (URL or search) |
 | `/pause`  | Pause the current track                                         |
 | `/resume` | Resume a paused track                                           |
 | `/skip`   | Skip to the next track in the queue                             |

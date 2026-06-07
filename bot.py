@@ -1620,6 +1620,8 @@ MUSIC_MAX_QUEUE = 100             # cap per guild
 MUSIC_SEARCH_TIMEOUT = 15         # yt-dlp resolution timeout (seconds)
 MUSIC_EMBED_COLOR = 0xED4245      # Vivid red — distinct from chat embeds
 MUSIC_PROGRESS_WIDTH = 18         # progress-bar character width
+PROGRESS_UPDATE_INTERVAL = 8      # seconds between live progress-bar message edits
+PLAYLIST_MAX = 50                 # cap tracks pulled from one playlist/album
 
 YTDL_OPTS = {
     "format": "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
@@ -1632,6 +1634,14 @@ YTDL_OPTS = {
     "skip_download": True,
 }
 
+# Fast, shallow extraction for playlists/sets — pulls the entry list without
+# resolving each track's stream URL (that happens lazily, just before play).
+YTDL_FLAT_OPTS = {
+    **YTDL_OPTS,
+    "noplaylist": False,
+    "extract_flat": "in_playlist",
+}
+
 # -nostdin keeps ffmpeg from grabbing the bot's stdin and racing other input.
 # Reconnect flags help with intermittent stream drops on long tracks.
 FFMPEG_BEFORE_OPTS = (
@@ -1642,7 +1652,10 @@ FFMPEG_OPTS = "-vn -loglevel warning"
 
 @dataclass
 class Track:
-    stream_url: str
+    # None for "lazy" tracks (from playlists) — stream_url is filled in by
+    # resolve_query just before the track plays. Avoids resolving 50 stream
+    # URLs up front (slow) and dodges YouTube URL expiry on long queues.
+    stream_url: str | None
     webpage_url: str
     title: str
     duration: int | None
@@ -1651,6 +1664,11 @@ class Track:
     thumbnail_url: str | None = None
     uploader: str | None = None        # e.g. "Rick Astley" — YouTube channel name
     source_label: str = "YouTube"      # for embed attribution (Spotify, Apple Music, SoundCloud)
+    resolve_query: str | None = None   # lazy tracks: query/URL to resolve at play time
+
+    @property
+    def is_resolved(self) -> bool:
+        return self.stream_url is not None
 
     def duration_str(self) -> str:
         if not self.duration:
@@ -1687,6 +1705,9 @@ class GuildMusic:
         # Set by skip()/jump() so the next _advance bypasses loop_mode for that
         # single transition (user explicitly wants to move forward, not loop).
         self._force_advance: bool = False
+        # Live progress bar: the now-playing message + the task editing it.
+        self._now_playing_msg: discord.Message | None = None
+        self._progress_task: asyncio.Task | None = None
 
     # ---- state queries ----
 
@@ -1759,6 +1780,46 @@ class GuildMusic:
             await self._advance(announce=False)
         return position
 
+    async def enqueue_many(self, tracks: list[Track]) -> int:
+        """Bulk-append (playlist). Starts playback in the background if idle so
+        the caller can respond immediately. Returns how many were queued."""
+        added = 0
+        async with self._lock:
+            for t in tracks:
+                if len(self.queue) >= MUSIC_MAX_QUEUE:
+                    break
+                self.queue.append(t)
+                added += 1
+        if added and not self.is_active() and self.current is None:
+            # Background so the /play command can post its "queued N" summary
+            # without waiting on the first track's lazy resolution.
+            bot.loop.create_task(self._advance(announce=True))
+        return added
+
+    async def _resolve_lazy(self, track: Track) -> bool:
+        """Fill in a lazy track's stream_url (and any missing metadata) via its
+        resolve_query. Returns True on success."""
+        if track.is_resolved:
+            return True
+        if not track.resolve_query:
+            return False
+        resolved = await resolve_track(
+            track.resolve_query, track.requester_id, track.requester_name
+        )
+        if resolved is None or not resolved.stream_url:
+            return False
+        track.stream_url = resolved.stream_url
+        # Prefer the real resolved URL when the lazy webpage_url was a placeholder
+        # (e.g. a Spotify page we can't play) or a bare search query.
+        if track.resolve_query.startswith("ytsearch") or not track.webpage_url:
+            track.webpage_url = resolved.webpage_url
+        track.duration = track.duration or resolved.duration
+        track.thumbnail_url = track.thumbnail_url or resolved.thumbnail_url
+        track.uploader = track.uploader or resolved.uploader
+        if not track.title or track.title == "(untitled)":
+            track.title = resolved.title
+        return True
+
     async def _advance(self, announce: bool = True) -> None:
         bypass_loop = self._force_advance
         self._force_advance = False
@@ -1784,6 +1845,7 @@ class GuildMusic:
                     self.queue.append(self.current)
                 if not self.queue:
                     self.current = None
+                    self._cancel_progress_task()
                     self._schedule_idle_disconnect()
                     return
                 next_track = self.queue.popleft()
@@ -1792,6 +1854,20 @@ class GuildMusic:
         if self.voice is None or not self.voice.is_connected():
             self.current = None
             return
+
+        # Lazy tracks (from playlists) resolve their stream URL here, just in
+        # time. On failure, drop it and advance to the next entry.
+        if not next_track.is_resolved:
+            ok = await self._resolve_lazy(next_track)
+            if not ok:
+                print(f"[music guild={self.guild_id}] could not resolve "
+                      f"{next_track.resolve_query!r}, skipping")
+                # Only advance if nothing else moved on in the meantime. Clear
+                # current first so loop=track can't infinitely retry a dead entry.
+                if self.current is next_track:
+                    self.current = None
+                    asyncio.create_task(self._advance(announce=announce))
+                return
 
         try:
             source = discord.FFmpegPCMAudio(
@@ -1814,6 +1890,9 @@ class GuildMusic:
         # channel fills up with identical embeds.
         if announce and not is_replay:
             await self._announce_now_playing()
+        elif is_replay and self._now_playing_msg is not None:
+            # Restart the live bar from 0:00 on the existing message.
+            self.register_now_playing(self._now_playing_msg)
 
     def _after_play(self, error: Exception | None) -> None:
         # Called from a non-async thread by discord.py's audio player.
@@ -1832,7 +1911,7 @@ class GuildMusic:
             return
         try:
             # Auto-announce fires the moment a track starts → elapsed ≈ 0.
-            await channel.send(
+            msg = await channel.send(
                 embed=_track_embed(
                     self.current,
                     "🎵 Now Playing",
@@ -1843,7 +1922,54 @@ class GuildMusic:
                 view=MusicControls(),
             )
         except discord.HTTPException:
-            pass
+            return
+        self.register_now_playing(msg)
+
+    # ---- live progress bar ----
+
+    def register_now_playing(self, message: discord.Message) -> None:
+        """Track a now-playing message and (re)start the task that edits its
+        progress bar every PROGRESS_UPDATE_INTERVAL seconds."""
+        self._cancel_progress_task()
+        self._now_playing_msg = message
+        # Only animate when we know the total duration (skip livestreams).
+        if self.current and self.current.duration:
+            self._progress_task = bot.loop.create_task(
+                self._progress_loop(self.current)
+            )
+
+    def _cancel_progress_task(self) -> None:
+        if self._progress_task and not self._progress_task.done():
+            self._progress_task.cancel()
+        self._progress_task = None
+
+    async def _progress_loop(self, track: Track) -> None:
+        try:
+            while True:
+                await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                # Stop if the track changed, the message is gone, or playback ended.
+                if self.current is not track or self._now_playing_msg is None:
+                    return
+                if not self.is_active():
+                    return
+                if self.is_paused():
+                    continue  # freeze the bar; resume picks back up
+                if track.duration and self.elapsed() >= track.duration:
+                    return
+                try:
+                    await self._now_playing_msg.edit(
+                        embed=_track_embed(
+                            track,
+                            "🎵 Now Playing",
+                            elapsed=self.elapsed(),
+                            loop_mode=self.loop_mode,
+                            volume_pct=int(round(self.volume * 100)),
+                        )
+                    )
+                except discord.HTTPException:
+                    return  # message deleted, token expired, etc.
+        except asyncio.CancelledError:
+            return
 
     # ---- control ----
 
@@ -1869,6 +1995,8 @@ class GuildMusic:
         return track
 
     async def stop_and_clear(self) -> None:
+        self._cancel_progress_task()
+        self._now_playing_msg = None
         async with self._lock:
             self.queue.clear()
             self.current = None
@@ -1878,6 +2006,8 @@ class GuildMusic:
 
     async def leave(self) -> None:
         self._cancel_idle_disconnect()
+        self._cancel_progress_task()
+        self._now_playing_msg = None
         async with self._lock:
             self.queue.clear()
             self.current = None
@@ -2115,7 +2245,9 @@ async def resolve_apple_music_track(url: str) -> str | None:
     return f"{title} {artist}".strip()
 
 
-async def resolve_track(query: str, requester: discord.Member) -> Track | None:
+async def resolve_track(
+    query: str, requester_id: int, requester_name: str
+) -> Track | None:
     """Resolve a query (URL or search text) into a playable Track.
 
     Routing:
@@ -2195,12 +2327,213 @@ async def resolve_track(query: str, requester: discord.Member) -> Track | None:
         webpage_url=info.get("webpage_url") or info.get("original_url") or query,
         title=info.get("title") or "(untitled)",
         duration=int(info["duration"]) if info.get("duration") else None,
-        requester_id=requester.id,
-        requester_name=requester.display_name,
+        requester_id=requester_id,
+        requester_name=requester_name,
         thumbnail_url=thumb_url,
         uploader=info.get("uploader") or info.get("channel") or info.get("creator"),
         source_label=source_label,
     )
+
+
+# ---- Playlist / album resolution (lazy tracks) ----
+
+SPOTIFY_PLAYLIST_RE = re.compile(
+    r"(?:open\.spotify\.com/(?:intl-\w+/)?playlist/|spotify:playlist:)([a-zA-Z0-9]+)"
+)
+SPOTIFY_ALBUM_RE = re.compile(
+    r"(?:open\.spotify\.com/(?:intl-\w+/)?album/|spotify:album:)([a-zA-Z0-9]+)"
+)
+APPLE_ALBUM_RE = re.compile(r"music\.apple\.com/[^/]+/album/[^/]+/(\d+)")
+
+
+def _is_playlist_url(query: str) -> bool:
+    q = query.lower()
+    if "open.spotify.com/playlist/" in q or q.startswith("spotify:playlist:"):
+        return True
+    if "open.spotify.com/album/" in q or q.startswith("spotify:album:"):
+        return True
+    # Apple Music album/playlist pages — but NOT a single-track link (?i=…).
+    if "music.apple.com" in q and ("/album/" in q or "/playlist/" in q):
+        if "?i=" not in q and "&i=" not in q:
+            return True
+    if "soundcloud.com" in q and "/sets/" in q:
+        return True
+    # Only treat an explicit YouTube playlist page as a playlist; a watch URL
+    # that merely carries &list=… still plays the single video.
+    if "youtube.com/playlist" in q:
+        return True
+    return False
+
+
+async def _resolve_ytdlp_playlist(
+    query: str, requester_id: int, requester_name: str
+) -> tuple[list[Track], str] | None:
+    """YouTube playlist / SoundCloud set → lazy Tracks via flat extraction."""
+    is_soundcloud = "soundcloud.com" in query.lower()
+
+    def _extract():
+        with yt_dlp.YoutubeDL(YTDL_FLAT_OPTS) as ydl:
+            return ydl.extract_info(query, download=False)
+
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(_extract), timeout=MUSIC_SEARCH_TIMEOUT * 2
+        )
+    except Exception as e:
+        print(f"[music] playlist extract failed for {query!r}: {e}")
+        return None
+
+    if not info:
+        return None
+    entries = [e for e in (info.get("entries") or []) if e]
+    if not entries:
+        return None
+    title = info.get("title") or ("SoundCloud set" if is_soundcloud else "playlist")
+
+    tracks: list[Track] = []
+    for e in entries[:PLAYLIST_MAX]:
+        url = e.get("url") or e.get("webpage_url")
+        if not url and e.get("id"):
+            url = f"https://www.youtube.com/watch?v={e['id']}"
+        if not url:
+            continue
+        tracks.append(Track(
+            stream_url=None,
+            webpage_url=e.get("webpage_url") or url,
+            title=e.get("title") or "(untitled)",
+            duration=int(e["duration"]) if e.get("duration") else None,
+            requester_id=requester_id,
+            requester_name=requester_name,
+            thumbnail_url=e.get("thumbnail"),
+            uploader=e.get("uploader") or e.get("channel"),
+            source_label="SoundCloud" if is_soundcloud else "YouTube",
+            resolve_query=url,
+        ))
+    return (tracks, title) if tracks else None
+
+
+async def _resolve_spotify_collection(
+    url: str, kind: str, requester_id: int, requester_name: str
+) -> tuple[list[Track], str] | None:
+    """Spotify playlist or album → lazy Tracks (each a YouTube search)."""
+    rx = SPOTIFY_PLAYLIST_RE if kind == "playlist" else SPOTIFY_ALBUM_RE
+    m = rx.search(url)
+    if not m:
+        return None
+    cid = m.group(1)
+    token = await _get_spotify_token()
+    if not token:
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"https://api.spotify.com/v1/{kind}s/{cid}",
+                headers={"Authorization": f"Bearer {token}"},
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[spotify] {kind} lookup HTTP {resp.status}")
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        print(f"[spotify] {kind} lookup failed: {e}")
+        return None
+
+    name = data.get("name") or f"Spotify {kind}"
+    items = (data.get("tracks") or {}).get("items") or []
+    tracks: list[Track] = []
+    for it in items[:PLAYLIST_MAX]:
+        t = it.get("track") if kind == "playlist" else it
+        if not t:
+            continue
+        title = (t.get("name") or "").strip()
+        if not title:
+            continue
+        artists = ", ".join(
+            a.get("name", "") for a in (t.get("artists") or []) if a.get("name")
+        )
+        spotify_url = (t.get("external_urls") or {}).get("spotify") or url
+        tracks.append(Track(
+            stream_url=None,
+            webpage_url=spotify_url,
+            title=f"{title} — {artists}" if artists else title,
+            duration=int(t["duration_ms"] / 1000) if t.get("duration_ms") else None,
+            requester_id=requester_id,
+            requester_name=requester_name,
+            source_label="Spotify (via YouTube)",
+            resolve_query=f"ytsearch1:{title} {artists}".strip(),
+        ))
+    return (tracks, name) if tracks else None
+
+
+async def _resolve_apple_album(
+    url: str, requester_id: int, requester_name: str
+) -> tuple[list[Track], str] | None:
+    """Apple Music album → lazy Tracks via the free iTunes lookup API.
+    Curated Apple Music playlists aren't in the iTunes API, so those return None."""
+    if "/playlist/" in url.lower():
+        return None  # unsupported — caller surfaces a clear message
+    m = APPLE_ALBUM_RE.search(url)
+    if not m:
+        return None
+    album_id = m.group(1)
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"https://itunes.apple.com/lookup?id={album_id}"
+                f"&entity=song&limit={PLAYLIST_MAX + 1}"
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[apple-music] album lookup HTTP {resp.status}")
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        print(f"[apple-music] album lookup failed: {e}")
+        return None
+
+    results = data.get("results") or []
+    if not results:
+        return None
+    name = "Apple Music album"
+    tracks: list[Track] = []
+    for r in results:
+        if r.get("wrapperType") != "track":
+            if r.get("collectionName"):
+                name = r["collectionName"]
+            continue
+        title = (r.get("trackName") or "").strip()
+        if not title:
+            continue
+        artist = (r.get("artistName") or "").strip()
+        tracks.append(Track(
+            stream_url=None,
+            webpage_url=r.get("trackViewUrl") or url,
+            title=f"{title} — {artist}" if artist else title,
+            duration=int(r["trackTimeMillis"] / 1000) if r.get("trackTimeMillis") else None,
+            requester_id=requester_id,
+            requester_name=requester_name,
+            source_label="Apple Music (via YouTube)",
+            resolve_query=f"ytsearch1:{title} {artist}".strip(),
+        ))
+    return (tracks[:PLAYLIST_MAX], name) if tracks else None
+
+
+async def resolve_playlist(
+    query: str, requester_id: int, requester_name: str
+) -> tuple[list[Track], str] | None:
+    """Route a playlist/album URL to the right resolver. Returns
+    (lazy_tracks, collection_title) or None."""
+    if not YTDLP_AVAILABLE:
+        return None
+    q = query.lower()
+    if "open.spotify.com/playlist/" in q or q.startswith("spotify:playlist:"):
+        return await _resolve_spotify_collection(query, "playlist", requester_id, requester_name)
+    if "open.spotify.com/album/" in q or q.startswith("spotify:album:"):
+        return await _resolve_spotify_collection(query, "album", requester_id, requester_name)
+    if "music.apple.com" in q:
+        return await _resolve_apple_album(query, requester_id, requester_name)
+    return await _resolve_ytdlp_playlist(query, requester_id, requester_name)
 
 
 def _format_time(seconds: float) -> str:
@@ -2698,8 +3031,8 @@ async def status_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-@tree.command(name="play", description="Play a track from YouTube (URL or search query).")
-@app_commands.describe(query="A YouTube URL or search terms")
+@tree.command(name="play", description="Play a track or playlist (URL or search query).")
+@app_commands.describe(query="A URL (track or playlist) or search terms")
 async def play_cmd(interaction: discord.Interaction, query: str):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
@@ -2749,7 +3082,43 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         )
         return
 
-    track = await resolve_track(query, interaction.user)
+    # ---- Playlist / album branch ----
+    if _is_playlist_url(query):
+        result = await resolve_playlist(
+            query, interaction.user.id, interaction.user.display_name
+        )
+        if not result or not result[0]:
+            if _is_spotify_url(query) and not SPOTIFY_AVAILABLE:
+                hint = (
+                    "Spotify playlists need `SPOTIFY_CLIENT_ID` and "
+                    "`SPOTIFY_CLIENT_SECRET` set on the host."
+                )
+            elif "music.apple.com" in query.lower() and "/playlist/" in query.lower():
+                hint = (
+                    "Apple Music **curated playlists** aren't supported (they're not "
+                    "in the public iTunes API). Album links work, though."
+                )
+            else:
+                hint = "Couldn't read that playlist, or it was empty."
+            await interaction.followup.send(
+                f"Couldn't queue `{query[:200]}`.\n{hint}", ephemeral=True
+            )
+            return
+        tracks, coll_title = result
+        added = await music.enqueue_many(tracks)
+        embed = discord.Embed(
+            description=(
+                f"**➕ Queued {added} track{'s' if added != 1 else ''}** "
+                f"from **{coll_title}**"
+            ),
+            color=MUSIC_EMBED_COLOR,
+        )
+        if added < len(tracks):
+            embed.set_footer(text=f"Capped at {MUSIC_MAX_QUEUE}-track queue limit")
+        await interaction.followup.send(embed=embed)
+        return
+
+    track = await resolve_track(query, interaction.user.id, interaction.user.display_name)
     if track is None:
         # Tailor the error to the input — Spotify needs creds, Apple Music
         # only handles single-track URLs, etc.
@@ -2776,7 +3145,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
     started_immediately = (music.current is None) and not music.is_active()
     position = await music.enqueue(track)
     if started_immediately:
-        await interaction.followup.send(
+        msg = await interaction.followup.send(
             embed=_track_embed(
                 track,
                 "🎵 Now Playing",
@@ -2786,6 +3155,9 @@ async def play_cmd(interaction: discord.Interaction, query: str):
             ),
             view=MusicControls(),
         )
+        # Drive the live progress bar off this message.
+        if msg is not None:
+            music.register_now_playing(msg)
     else:
         await interaction.followup.send(
             embed=_track_embed(track, "➕ Added to Queue", position=position)
