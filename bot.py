@@ -736,6 +736,7 @@ auto_channels: dict[int, set[int]] = {}   # guild_id -> {channel_ids}
 guild_moods: dict[int, str] = {}          # guild_id -> mood
 convo_moods: dict[str, str] = {}          # conversation_key -> mood
 convo_overrides_touched: dict[str, float] = {}  # last time a convo override was used
+dj_roles: dict[int, int] = {}             # guild_id -> role_id (music control gate)
 
 cleanup_runs = 0
 
@@ -743,7 +744,7 @@ cleanup_runs = 0
 # ---------- Persistence ----------
 
 def load_config():
-    global auto_channels, guild_moods, convo_moods, convo_overrides_touched
+    global auto_channels, guild_moods, convo_moods, convo_overrides_touched, dj_roles
     if not CONFIG_PATH.exists():
         return
     try:
@@ -761,6 +762,7 @@ def load_config():
         convo_overrides_touched = {
             str(k): float(t) for k, t in data.get("convo_overrides_touched", {}).items()
         }
+        dj_roles      = {int(g): int(r) for g, r in data.get("dj_roles", {}).items()}
     except Exception as e:
         print(f"Failed to load config: {e}")
 
@@ -778,6 +780,7 @@ def save_config():
             "guild_moods":   {str(g): m for g, m in guild_moods.items()},
             "convo_moods":   convo_moods,
             "convo_overrides_touched": convo_overrides_touched,
+            "dj_roles":      {str(g): r for g, r in dj_roles.items()},
         }, indent=2))
     except Exception as e:
         print(f"Failed to save config: {e}")
@@ -2627,6 +2630,12 @@ class MusicControls(discord.ui.View):
                 "Music only works in servers.", ephemeral=True
             )
             return None
+        # Buttons are all control actions — gate them behind the DJ role.
+        if not member_is_dj(interaction.user, interaction.guild_id):
+            await interaction.response.send_message(
+                _dj_denied_msg(interaction.guild_id), ephemeral=True
+            )
+            return None
         return guild_music.get(interaction.guild_id)
 
     @discord.ui.button(emoji="⏮", style=discord.ButtonStyle.secondary, row=0)
@@ -2732,6 +2741,48 @@ def _user_voice_channel(interaction: discord.Interaction):
         return None
     voice = interaction.user.voice
     return voice.channel if voice else None
+
+
+# ---- DJ role gating ----
+
+def member_is_dj(member, guild_id: int) -> bool:
+    """True if the member may use music control commands.
+
+    Open to everyone when no DJ role is configured. Once a DJ role is set, only
+    that role — plus anyone with Manage Channels / Manage Server / Administrator
+    (staff bypass) — can control playback.
+    """
+    role_id = dj_roles.get(guild_id)
+    if not role_id:
+        return True
+    if not isinstance(member, discord.Member):
+        return True
+    perms = member.guild_permissions
+    if perms.manage_channels or perms.manage_guild or perms.administrator:
+        return True
+    return any(r.id == role_id for r in member.roles)
+
+
+def _dj_denied_msg(guild_id: int) -> str:
+    role_id = dj_roles.get(guild_id)
+    mention = f"<@&{role_id}>" if role_id else "DJ"
+    return (
+        f"🎧 You need the {mention} role (or Manage Server) to control playback. "
+        f"You can still use `/play`, `/queue`, and `/nowplaying`."
+    )
+
+
+async def _require_dj(interaction: discord.Interaction) -> bool:
+    """Gate a control command. Returns True if allowed; otherwise sends an
+    ephemeral denial and returns False. Call after the guild-None check."""
+    if interaction.guild is None:
+        return True
+    if member_is_dj(interaction.user, interaction.guild.id):
+        return True
+    await interaction.response.send_message(
+        _dj_denied_msg(interaction.guild.id), ephemeral=True
+    )
+    return False
 
 
 # ---------- Slash commands ----------
@@ -3169,6 +3220,8 @@ async def pause_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
+    if not await _require_dj(interaction):
+        return
     music = guild_music.get(interaction.guild.id)
     if not music or not music.pause():
         await interaction.response.send_message("Nothing playing.", ephemeral=True)
@@ -3181,6 +3234,8 @@ async def resume_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
+    if not await _require_dj(interaction):
+        return
     music = guild_music.get(interaction.guild.id)
     if not music or not music.resume():
         await interaction.response.send_message("Nothing paused.", ephemeral=True)
@@ -3192,6 +3247,8 @@ async def resume_cmd(interaction: discord.Interaction):
 async def skip_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    if not await _require_dj(interaction):
         return
     music = guild_music.get(interaction.guild.id)
     if not music or not music.is_active():
@@ -3207,6 +3264,8 @@ async def stop_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
+    if not await _require_dj(interaction):
+        return
     music = guild_music.get(interaction.guild.id)
     if not music or (not music.is_active() and not music.queue and not music.current):
         await interaction.response.send_message("Nothing playing.", ephemeral=True)
@@ -3219,6 +3278,8 @@ async def stop_cmd(interaction: discord.Interaction):
 async def leave_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    if not await _require_dj(interaction):
         return
     music = guild_music.get(interaction.guild.id)
     if not music or music.voice is None or not music.voice.is_connected():
@@ -3295,6 +3356,8 @@ async def loop_cmd(
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
+    if not await _require_dj(interaction):
+        return
     music = get_or_create_music(interaction.guild.id)
     resolved = music.set_loop(mode.value)
     labels = {
@@ -3309,6 +3372,8 @@ async def loop_cmd(
 async def shuffle_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    if not await _require_dj(interaction):
         return
     music = guild_music.get(interaction.guild.id)
     if not music or len(music.queue) < 2:
@@ -3325,6 +3390,8 @@ async def shuffle_cmd(interaction: discord.Interaction):
 async def volume_cmd(interaction: discord.Interaction, level: int):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    if not await _require_dj(interaction):
         return
     if level < 0 or level > 200:
         await interaction.response.send_message(
@@ -3349,6 +3416,8 @@ async def remove_cmd(interaction: discord.Interaction, position: int):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
+    if not await _require_dj(interaction):
+        return
     music = guild_music.get(interaction.guild.id)
     if not music or not music.queue:
         await interaction.response.send_message("Queue is empty.", ephemeral=True)
@@ -3368,6 +3437,8 @@ async def clear_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
+    if not await _require_dj(interaction):
+        return
     music = guild_music.get(interaction.guild.id)
     if not music or not music.queue:
         await interaction.response.send_message("Queue is already empty.", ephemeral=True)
@@ -3382,6 +3453,8 @@ async def jump_cmd(interaction: discord.Interaction, position: int):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
+    if not await _require_dj(interaction):
+        return
     music = guild_music.get(interaction.guild.id)
     if not music or not music.queue:
         await interaction.response.send_message("Queue is empty.", ephemeral=True)
@@ -3393,6 +3466,65 @@ async def jump_cmd(interaction: discord.Interaction, position: int):
         )
         return
     await interaction.response.send_message(f"⏩ Jumping to **{target.title}**.")
+
+
+@tree.command(name="dj", description="Set the DJ role (only it can control playback), or show the current one.")
+@app_commands.describe(role="Role allowed to control music. Omit to show the current DJ role.")
+async def dj_cmd(
+    interaction: discord.Interaction, role: discord.Role | None = None
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("This only works in servers.", ephemeral=True)
+        return
+    if role is None:
+        current = dj_roles.get(interaction.guild.id)
+        if current:
+            await interaction.response.send_message(
+                f"🎧 Current DJ role: <@&{current}>. Only they (and Manage Server) can "
+                f"skip/stop/pause/etc. Use `/dj role:` to change it, or `/djoff` to clear.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "No DJ role set — **everyone** can control playback. "
+                "Use `/dj role:@SomeRole` to lock controls to a role.",
+                ephemeral=True,
+            )
+        return
+    if not _check_manage(interaction):
+        await interaction.response.send_message(
+            "You need Manage Channels to set the DJ role.", ephemeral=True
+        )
+        return
+    dj_roles[interaction.guild.id] = role.id
+    save_config()
+    await interaction.response.send_message(
+        f"🎧 DJ role set to {role.mention}. Only they (and anyone with Manage Server) "
+        f"can skip, stop, pause, loop, change volume, etc. Everyone can still "
+        f"`/play`, `/queue`, and `/nowplaying`."
+    )
+
+
+@tree.command(name="djoff", description="Clear the DJ role so everyone can control playback again.")
+async def djoff_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("This only works in servers.", ephemeral=True)
+        return
+    if not _check_manage(interaction):
+        await interaction.response.send_message(
+            "You need Manage Channels to change the DJ role.", ephemeral=True
+        )
+        return
+    if interaction.guild.id in dj_roles:
+        dj_roles.pop(interaction.guild.id, None)
+        save_config()
+        await interaction.response.send_message(
+            "🎧 DJ role cleared — **everyone** can control playback now."
+        )
+    else:
+        await interaction.response.send_message(
+            "No DJ role was set.", ephemeral=True
+        )
 
 
 def _shutdown_flush():

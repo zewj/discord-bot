@@ -95,6 +95,7 @@ python bot.py
   - **Apple Music** — paste a single-track URL (`music.apple.com/…?i=…`); no credentials needed (uses iTunes Search API)
   - **Playlists & albums** — paste a YouTube playlist, SoundCloud set, Spotify playlist/album, or Apple Music album URL to queue all of it at once (capped at 50 tracks). Playlist tracks resolve lazily — each one's stream is fetched just before it plays, so big queues start instantly and stream URLs never go stale. (Apple Music *curated playlists* aren't supported — not exposed by the iTunes API — but albums are.)
   - **Now-playing embed** has a **live progress bar** that updates as the track plays, plus ⏮ ⏯ ⏭ ⏹ / 🔁 🔀 buttons
+  - **DJ role** (optional): run `/dj role:@DJ` to lock the control actions (skip, stop, pause, loop, volume, shuffle, remove, clear, jump, leave — slash commands *and* the embed buttons) to that role. Anyone with Manage Server bypasses it. `/play`, `/queue`, and `/nowplaying` stay open to everyone. `/djoff` removes the lock. With no DJ role set, controls are open to all (default)
   - Auto-disconnects after 5 minutes idle
 
 ## Slash commands
@@ -122,6 +123,8 @@ python bot.py
 | `/remove` | Remove a track from the queue by position                       |
 | `/clear`  | Clear the queue but keep the current track playing              |
 | `/jump`   | Skip ahead to a specific queue position                         |
+| `/dj`     | Set the DJ role (only it can control playback), or show the current one (Manage Channels to set) |
+| `/djoff`  | Clear the DJ role so everyone can control playback again (Manage Channels) |
 
 `/mood` accepts a `scope` arg:
 - `server` (default) — applies to the whole guild (requires Manage Channels)
