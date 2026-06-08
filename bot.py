@@ -1747,20 +1747,20 @@ MUSIC_EARLY_DEATH_SECONDS = 8
 
 
 def _ffmpeg_before_options(track: "Track") -> str:
-    """Base reconnect flags + the HTTP headers yt-dlp wants for this stream.
+    """Base reconnect flags + the User-Agent yt-dlp wants for this stream.
 
     YouTube 403s the stream URL when ffmpeg's User-Agent doesn't match the
-    client that extracted it, so we forward yt-dlp's headers to ffmpeg.
+    client that extracted it, so we forward yt-dlp's UA via -user_agent. We
+    intentionally don't forward the other headers (Accept-Language, Sec-Fetch-*,
+    etc.) — they don't affect the 403 and ffmpeg's -headers expects real CRLF
+    framing that's fiddly to pass through shlex (the source of the "No trailing
+    CRLF" warning). The UA is the part that actually matters.
     """
     parts = [FFMPEG_BEFORE_OPTS]
     headers = track.http_headers or {}
     ua = headers.get("User-Agent") or headers.get("user-agent")
     if ua:
         parts.append(f'-user_agent "{ua}"')
-    extra = [f"{k}: {v}" for k, v in headers.items() if k.lower() != "user-agent"]
-    if extra:
-        blob = "".join(h + "\\r\\n" for h in extra)
-        parts.append(f'-headers "{blob}"')
     return " ".join(parts)
 
 
