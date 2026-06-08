@@ -1838,6 +1838,11 @@ class GuildMusic:
         # recent video IDs so the radio doesn't loop the same handful of songs.
         self._last_played: Track | None = None
         self._recent_ids: deque[str] = deque(maxlen=80)
+        # Prefetched, fully-resolved next autoplay track + the task fetching it,
+        # so the radio plays instantly when the current song ends instead of
+        # stalling on a fetch+resolve after the gap.
+        self._next_autoplay: Track | None = None
+        self._prefetch_task: asyncio.Task | None = None
         # Set by stop/leave so the resulting _advance doesn't autoplay a new
         # track (which would undo the stop). Consumed on the next _advance.
         self._stopping: bool = False
@@ -1998,10 +2003,16 @@ class GuildMusic:
         return True
 
     async def _try_autoplay(self) -> Track | None:
-        """When the queue empties, fetch a related track to keep playing — if
-        autoplay is enabled for this guild and we have a seed to work from."""
+        """When the queue empties, return a related track to keep playing — if
+        autoplay is enabled. Uses the background-prefetched track (instant) when
+        available, else fetches one live as a fallback."""
         if not guild_autoplay.get(self.guild_id, True):
             return None
+        # Prefetched while the previous track was still playing → instant.
+        if self._next_autoplay is not None:
+            nxt = self._next_autoplay
+            self._next_autoplay = None
+            return nxt
         seed = self._last_played
         if seed is None:
             return None
@@ -2014,6 +2025,60 @@ class GuildMusic:
         except Exception as e:
             print(f"[music guild={self.guild_id}] autoplay fetch failed: {e}")
             return None
+
+    def _cancel_prefetch(self) -> None:
+        if self._prefetch_task and not self._prefetch_task.done():
+            self._prefetch_task.cancel()
+        self._prefetch_task = None
+        self._next_autoplay = None
+
+    def _maybe_prefetch_autoplay(self) -> None:
+        """Kick off a background fetch+resolve of the next autoplay track while
+        the current one plays, so it's ready to fire instantly when this ends."""
+        if not guild_autoplay.get(self.guild_id, True):
+            return
+        if self.loop_mode != "off":
+            return  # looping won't fall through to autoplay
+        if self.queue:
+            return  # real tracks are queued; no autoplay needed yet
+        if self._next_autoplay is not None:
+            return  # already have one ready
+        if self._prefetch_task and not self._prefetch_task.done():
+            return  # already fetching
+        if self._last_played is None:
+            return
+        self._prefetch_task = bot.loop.create_task(self._prefetch_autoplay())
+
+    async def _prefetch_autoplay(self) -> None:
+        seed = self._last_played
+        if seed is None:
+            return
+        try:
+            lazy = await fetch_autoplay_track(
+                seed, set(self._recent_ids),
+                requester_id=bot.user.id if bot.user else 0,
+                requester_name="Autoplay",
+            )
+            if lazy is None or not lazy.resolve_query:
+                return
+            # Resolve the stream URL now so playback is instant later.
+            resolved = await resolve_track(
+                lazy.resolve_query, lazy.requester_id, lazy.requester_name
+            )
+            if resolved is None or not resolved.stream_url:
+                return
+            resolved.source_label = "Autoplay"
+            if lazy.title and lazy.title != "(untitled)":
+                resolved.title = lazy.title
+            # Only keep it if it's still wanted (queue still empty, autoplay on).
+            if (
+                guild_autoplay.get(self.guild_id, True)
+                and not self.queue
+                and self._next_autoplay is None
+            ):
+                self._next_autoplay = resolved
+        except Exception as e:
+            print(f"[music guild={self.guild_id}] autoplay prefetch failed: {e}")
 
     async def _advance(self, announce: bool = True) -> None:
         bypass_loop = self._force_advance
@@ -2100,6 +2165,9 @@ class GuildMusic:
         vid = _youtube_video_id(next_track.webpage_url)
         if vid and vid not in self._recent_ids:
             self._recent_ids.append(vid)
+        # Start prefetching the next radio track now so it's ready the instant
+        # this one ends (no mid-gap fetch+resolve stall).
+        self._maybe_prefetch_autoplay()
         # Suppress the auto-announce when looping the same track, otherwise the
         # channel fills up with identical embeds.
         if announce and not is_replay:
@@ -2250,6 +2318,7 @@ class GuildMusic:
 
     async def stop_and_clear(self) -> None:
         self._cancel_progress_task()
+        self._cancel_prefetch()
         self._now_playing_msg = None
         self.skip_votes.clear()
         self.leave_votes.clear()
@@ -2265,6 +2334,7 @@ class GuildMusic:
     async def leave(self) -> None:
         self._cancel_idle_disconnect()
         self._cancel_progress_task()
+        self._cancel_prefetch()
         self._now_playing_msg = None
         self.skip_votes.clear()
         self.leave_votes.clear()
