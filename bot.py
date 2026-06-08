@@ -1797,9 +1797,12 @@ YTDL_FLAT_OPTS = {
 }
 
 # -nostdin keeps ffmpeg from grabbing the bot's stdin and racing other input.
-# Reconnect flags help with intermittent stream drops on long tracks.
+# Reconnect flags recover from YouTube CDN drops ("Connection reset by peer")
+# that otherwise cause a ~1s gap: reconnect on EOF/streamed/network-error, retry
+# fast (max 2s between attempts) so the stream resumes quickly.
 FFMPEG_BEFORE_OPTS = (
-    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
+    "-reconnect_delay_max 2 -nostdin"
 )
 FFMPEG_OPTS = "-vn -loglevel warning"
 
@@ -2209,6 +2212,11 @@ class GuildMusic:
                 if any(_normalize_title(t.title) == norm for t in self._autoplay_buffer):
                     continue
                 self._autoplay_buffer.append(resolved)
+                # Space out the heavy yt-dlp resolves so a CPU spike doesn't
+                # starve the audio encoder and stutter playback. The first one
+                # lands immediately; only the extra lookahead waits.
+                if len(self._autoplay_buffer) < AUTOPLAY_BUFFER:
+                    await asyncio.sleep(4.0)
         except Exception as e:
             print(f"[music guild={self.guild_id}] autoplay prefetch failed: {e}")
 
