@@ -1672,6 +1672,10 @@ YTDL_OPTS = {
     "noplaylist": True,
     "extract_flat": False,
     "skip_download": True,
+    # Prefer YouTube clients that hand back directly-fetchable stream URLs.
+    # The default rotation sometimes lands on android_vr, whose URLs 403 when
+    # ffmpeg fetches them with a mismatched User-Agent. These are sturdier.
+    "extractor_args": {"youtube": {"player_client": ["ios", "web_safari", "mweb", "tv"]}},
 }
 
 # Fast, shallow extraction for playlists/sets — pulls the entry list without
@@ -1689,6 +1693,28 @@ FFMPEG_BEFORE_OPTS = (
 )
 FFMPEG_OPTS = "-vn -loglevel warning"
 
+# A track that dies in under this many seconds (with a much longer duration) is
+# treated as a failed stream and re-resolved once. Covers 403s / expired URLs.
+MUSIC_EARLY_DEATH_SECONDS = 8
+
+
+def _ffmpeg_before_options(track: "Track") -> str:
+    """Base reconnect flags + the HTTP headers yt-dlp wants for this stream.
+
+    YouTube 403s the stream URL when ffmpeg's User-Agent doesn't match the
+    client that extracted it, so we forward yt-dlp's headers to ffmpeg.
+    """
+    parts = [FFMPEG_BEFORE_OPTS]
+    headers = track.http_headers or {}
+    ua = headers.get("User-Agent") or headers.get("user-agent")
+    if ua:
+        parts.append(f'-user_agent "{ua}"')
+    extra = [f"{k}: {v}" for k, v in headers.items() if k.lower() != "user-agent"]
+    if extra:
+        blob = "".join(h + "\\r\\n" for h in extra)
+        parts.append(f'-headers "{blob}"')
+    return " ".join(parts)
+
 
 @dataclass
 class Track:
@@ -1705,6 +1731,8 @@ class Track:
     uploader: str | None = None        # e.g. "Rick Astley" — YouTube channel name
     source_label: str = "YouTube"      # for embed attribution (Spotify, Apple Music, SoundCloud)
     resolve_query: str | None = None   # lazy tracks: query/URL to resolve at play time
+    http_headers: dict | None = None   # headers yt-dlp says to send when fetching the stream
+    _retry_count: int = 0              # fresh-resolution retries used (403/early-death recovery)
 
     @property
     def is_resolved(self) -> bool:
@@ -1755,6 +1783,9 @@ class GuildMusic:
         # True when playback was auto-paused because the channel emptied out, so
         # we know to auto-resume (and not clobber a manual pause) when it refills.
         self._auto_paused: bool = False
+        # Set right before an intentional voice.stop() (skip/restart/stop/jump)
+        # so _after_play knows the early end was deliberate, not a failed stream.
+        self._expect_stop: bool = False
 
     # ---- state queries ----
 
@@ -1906,6 +1937,7 @@ class GuildMusic:
         track.duration = track.duration or resolved.duration
         track.thumbnail_url = track.thumbnail_url or resolved.thumbnail_url
         track.uploader = track.uploader or resolved.uploader
+        track.http_headers = resolved.http_headers
         if not track.title or track.title == "(untitled)":
             track.title = resolved.title
         return True
@@ -1964,7 +1996,7 @@ class GuildMusic:
             source = discord.FFmpegPCMAudio(
                 next_track.stream_url,
                 executable=FFMPEG_PATH or "ffmpeg",
-                before_options=FFMPEG_BEFORE_OPTS,
+                before_options=_ffmpeg_before_options(next_track),
                 options=FFMPEG_OPTS,
             )
             source = discord.PCMVolumeTransformer(source, volume=self.volume)
@@ -1989,10 +2021,47 @@ class GuildMusic:
         # Called from a non-async thread by discord.py's audio player.
         if error:
             print(f"[music guild={self.guild_id}] ffmpeg error: {error}")
+
+        intentional = self._expect_stop
+        self._expect_stop = False
+        played = self.elapsed()
+        track = self.current
+
+        # A stream that dies almost immediately (and wasn't a user skip/stop) is
+        # almost always a 403 / expired URL. Re-resolve fresh and retry once.
+        if (
+            not intentional
+            and track is not None
+            and track.duration and track.duration > MUSIC_EARLY_DEATH_SECONDS * 2
+            and played < MUSIC_EARLY_DEATH_SECONDS
+            and track._retry_count < 1
+        ):
+            print(f"[music guild={self.guild_id}] '{track.title}' died after "
+                  f"{played:.1f}s — re-resolving and retrying")
+            track._retry_count += 1
+            # Force a fresh resolution next time it's picked up.
+            track.stream_url = None
+            if not track.resolve_query:
+                track.resolve_query = track.webpage_url
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._requeue_front_and_advance(track), bot.loop
+                )
+            except Exception as e:
+                print(f"[music guild={self.guild_id}] retry scheduling failed: {e}")
+            return
+
         try:
             asyncio.run_coroutine_threadsafe(self._advance(), bot.loop)
         except Exception as e:
             print(f"[music guild={self.guild_id}] advance scheduling failed: {e}")
+
+    async def _requeue_front_and_advance(self, track: Track) -> None:
+        async with self._lock:
+            self.queue.appendleft(track)
+        # Bypass loop logic for this transition so we replay THIS track, fresh.
+        self._force_advance = True
+        await self._advance(announce=False)
 
     async def _announce_now_playing(self) -> None:
         if not self.current or not self.last_text_channel_id:
@@ -2069,6 +2138,7 @@ class GuildMusic:
         # User explicitly wants to move forward — bypass loop_mode for this
         # one transition so loop=track doesn't replay the same song.
         self._force_advance = True
+        self._expect_stop = True  # deliberate end → don't trigger the retry
         if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
             self.voice.stop()  # triggers _after_play -> _advance
         return skipped
@@ -2081,6 +2151,8 @@ class GuildMusic:
         track = self.current
         async with self._lock:
             self.queue.appendleft(track)
+        self._force_advance = True
+        self._expect_stop = True
         if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
             self.voice.stop()
         return track
@@ -2090,6 +2162,7 @@ class GuildMusic:
         self._now_playing_msg = None
         self.skip_votes.clear()
         self.leave_votes.clear()
+        self._expect_stop = True
         async with self._lock:
             self.queue.clear()
             self.current = None
@@ -2175,6 +2248,7 @@ class GuildMusic:
                 self.queue.popleft()
             target = self.queue[0]
         self._force_advance = True
+        self._expect_stop = True
         if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
             self.voice.stop()
         return target
@@ -2429,6 +2503,7 @@ async def resolve_track(
         thumbnail_url=thumb_url,
         uploader=info.get("uploader") or info.get("channel") or info.get("creator"),
         source_label=source_label,
+        http_headers=info.get("http_headers"),
     )
 
 
