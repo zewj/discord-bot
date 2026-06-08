@@ -172,6 +172,9 @@ SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
 # YTDLP_COOKIES_FROM_BROWSER to a browser name (chrome/firefox/edge/…).
 YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES")
 YTDLP_COOKIES_FROM_BROWSER = os.environ.get("YTDLP_COOKIES_FROM_BROWSER")
+# Last-resort fix for hard-blocked datacenter IPs: route yt-dlp through a proxy
+# (ideally residential). Format: http://user:pass@host:port  or  socks5://host:port
+YTDLP_PROXY = os.environ.get("YTDLP_PROXY")
 
 # ---------- Config ----------
 
@@ -1632,6 +1635,10 @@ async def on_ready():
     else:
         print("  yt-dlp cookies: OFF — set YTDLP_COOKIES on flagged/datacenter IPs "
               "if you hit 'format not available'")
+    if MUSIC_AVAILABLE and YTDLP_PROXY:
+        # Mask credentials in the printed proxy URL.
+        shown = re.sub(r"//[^@/]+@", "//***@", YTDLP_PROXY)
+        print(f"  yt-dlp proxy: ON ({shown})")
     print("=" * 60)
 
 
@@ -1755,6 +1762,10 @@ if YTDLP_COOKIES:
     YTDL_OPTS["cookiefile"] = YTDLP_COOKIES
 elif YTDLP_COOKIES_FROM_BROWSER:
     YTDL_OPTS["cookiesfrombrowser"] = (YTDLP_COOKIES_FROM_BROWSER,)
+
+# Route every yt-dlp request through a proxy when set (for hard-blocked IPs).
+if YTDLP_PROXY:
+    YTDL_OPTS["proxy"] = YTDLP_PROXY
 
 # Fast, shallow extraction for playlists/sets — pulls the entry list without
 # resolving each track's stream URL (that happens lazily, just before play).
