@@ -779,6 +779,7 @@ guild_moods: dict[int, str] = {}          # guild_id -> mood
 convo_moods: dict[str, str] = {}          # conversation_key -> mood
 convo_overrides_touched: dict[str, float] = {}  # last time a convo override was used
 dj_roles: dict[int, int] = {}             # guild_id -> role_id (music control gate)
+guild_autoplay: dict[int, bool] = {}      # guild_id -> autoplay on/off (default on)
 
 cleanup_runs = 0
 
@@ -787,6 +788,7 @@ cleanup_runs = 0
 
 def load_config():
     global auto_channels, guild_moods, convo_moods, convo_overrides_touched, dj_roles
+    global guild_autoplay
     if not CONFIG_PATH.exists():
         return
     try:
@@ -805,6 +807,7 @@ def load_config():
             str(k): float(t) for k, t in data.get("convo_overrides_touched", {}).items()
         }
         dj_roles      = {int(g): int(r) for g, r in data.get("dj_roles", {}).items()}
+        guild_autoplay = {int(g): bool(v) for g, v in data.get("guild_autoplay", {}).items()}
     except Exception as e:
         print(f"Failed to load config: {e}")
 
@@ -823,6 +826,7 @@ def save_config():
             "convo_moods":   convo_moods,
             "convo_overrides_touched": convo_overrides_touched,
             "dj_roles":      {str(g): r for g, r in dj_roles.items()},
+            "guild_autoplay": {str(g): v for g, v in guild_autoplay.items()},
         }, indent=2))
     except Exception as e:
         print(f"Failed to save config: {e}")
@@ -1828,6 +1832,13 @@ class GuildMusic:
         # Set right before an intentional voice.stop() (skip/restart/stop/jump)
         # so _after_play knows the early end was deliberate, not a failed stream.
         self._expect_stop: bool = False
+        # Autoplay (radio): seed off the last track that played, and remember
+        # recent video IDs so the radio doesn't loop the same handful of songs.
+        self._last_played: Track | None = None
+        self._recent_ids: deque[str] = deque(maxlen=80)
+        # Set by stop/leave so the resulting _advance doesn't autoplay a new
+        # track (which would undo the stop). Consumed on the next _advance.
+        self._stopping: bool = False
 
     # ---- state queries ----
 
@@ -1984,6 +1995,24 @@ class GuildMusic:
             track.title = resolved.title
         return True
 
+    async def _try_autoplay(self) -> Track | None:
+        """When the queue empties, fetch a related track to keep playing — if
+        autoplay is enabled for this guild and we have a seed to work from."""
+        if not guild_autoplay.get(self.guild_id, True):
+            return None
+        seed = self._last_played
+        if seed is None:
+            return None
+        try:
+            return await fetch_autoplay_track(
+                seed, set(self._recent_ids),
+                requester_id=bot.user.id if bot.user else 0,
+                requester_name="Autoplay",
+            )
+        except Exception as e:
+            print(f"[music guild={self.guild_id}] autoplay fetch failed: {e}")
+            return None
+
     async def _advance(self, announce: bool = True) -> None:
         bypass_loop = self._force_advance
         self._force_advance = False
@@ -2007,14 +2036,27 @@ class GuildMusic:
                     and self.current is not None
                 ):
                     self.queue.append(self.current)
-                if not self.queue:
-                    self.current = None
-                    self._cancel_progress_task()
-                    self._schedule_idle_disconnect()
+                queue_empty = not self.queue
+                if not queue_empty:
+                    next_track = self.queue.popleft()
+                    self.current = next_track
+                    self.skip_votes.clear()  # fresh track → fresh skip vote
+
+        # Queue ran dry. Try autoplay (a related track) before going idle —
+        # unless we got here via an explicit /stop or /leave.
+        if not is_replay and queue_empty:
+            if not self._stopping:
+                auto = await self._try_autoplay()
+                if auto is not None:
+                    async with self._lock:
+                        self.queue.append(auto)
+                    await self._advance(announce=announce)
                     return
-                next_track = self.queue.popleft()
-                self.current = next_track
-                self.skip_votes.clear()  # fresh track → fresh skip vote
+            self._stopping = False
+            self.current = None
+            self._cancel_progress_task()
+            self._schedule_idle_disconnect()
+            return
 
         if self.voice is None or not self.voice.is_connected():
             self.current = None
@@ -2051,6 +2093,11 @@ class GuildMusic:
 
         self._start_timer()
         self._cancel_idle_disconnect()
+        # Remember this as the autoplay seed + mark it recently played.
+        self._last_played = next_track
+        vid = _youtube_video_id(next_track.webpage_url)
+        if vid and vid not in self._recent_ids:
+            self._recent_ids.append(vid)
         # Suppress the auto-announce when looping the same track, otherwise the
         # channel fills up with identical embeds.
         if announce and not is_replay:
@@ -2205,6 +2252,7 @@ class GuildMusic:
         self.skip_votes.clear()
         self.leave_votes.clear()
         self._expect_stop = True
+        self._stopping = True  # don't let autoplay revive a deliberate stop
         async with self._lock:
             self.queue.clear()
             self.current = None
@@ -2218,6 +2266,8 @@ class GuildMusic:
         self._now_playing_msg = None
         self.skip_votes.clear()
         self.leave_votes.clear()
+        self._expect_stop = True
+        self._stopping = True
         async with self._lock:
             self.queue.clear()
             self.current = None
@@ -2748,6 +2798,83 @@ async def resolve_playlist(
     if "music.apple.com" in q:
         return await _resolve_apple_album(query, requester_id, requester_name)
     return await _resolve_ytdlp_playlist(query, requester_id, requester_name)
+
+
+# ---- Autoplay (radio): keep playing related tracks when the queue empties ----
+
+_YT_ID_RE = re.compile(
+    r"(?:youtube\.com/watch\?(?:.*&)?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)"
+    r"([A-Za-z0-9_-]{11})"
+)
+
+
+def _youtube_video_id(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = _YT_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+async def fetch_autoplay_track(
+    seed: "Track", exclude_ids: set[str], requester_id: int, requester_name: str
+) -> "Track | None":
+    """Find a track related to `seed` to continue playback (radio).
+
+    Primary: seed YouTube's Mix (RD<video_id>) and take the first entry not
+    already played. Fallback: search the seed's uploader/title. Returns a LAZY
+    Track (resolves its stream at play time), or None.
+    """
+    if not YTDLP_AVAILABLE:
+        return None
+
+    seed_id = _youtube_video_id(seed.webpage_url)
+
+    def _flat(url_or_query: str):
+        with yt_dlp.YoutubeDL(YTDL_FLAT_OPTS) as ydl:
+            return ydl.extract_info(url_or_query, download=False)
+
+    entries: list[dict] = []
+    if seed_id:
+        mix_url = f"https://www.youtube.com/watch?v={seed_id}&list=RD{seed_id}"
+        try:
+            info = await asyncio.wait_for(
+                asyncio.to_thread(_flat, mix_url), timeout=MUSIC_SEARCH_TIMEOUT
+            )
+            entries = [e for e in (info.get("entries") or []) if e]
+        except Exception as e:
+            print(f"[autoplay] mix fetch failed: {e}")
+
+    # Fallback: search by uploader/title for something in the same vein.
+    if not entries:
+        seed_terms = (seed.uploader or seed.title or "").strip()
+        if seed_terms:
+            try:
+                info = await asyncio.wait_for(
+                    asyncio.to_thread(_flat, f"ytsearch10:{seed_terms}"),
+                    timeout=MUSIC_SEARCH_TIMEOUT,
+                )
+                entries = [e for e in (info.get("entries") or []) if e]
+            except Exception as e:
+                print(f"[autoplay] fallback search failed: {e}")
+
+    for e in entries:
+        vid = e.get("id")
+        if not vid or vid == seed_id or vid in exclude_ids:
+            continue
+        url = e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
+        return Track(
+            stream_url=None,
+            webpage_url=f"https://www.youtube.com/watch?v={vid}",
+            title=e.get("title") or "(untitled)",
+            duration=int(e["duration"]) if e.get("duration") else None,
+            requester_id=requester_id,
+            requester_name=requester_name,
+            thumbnail_url=e.get("thumbnail"),
+            uploader=e.get("uploader") or e.get("channel"),
+            source_label="Autoplay",
+            resolve_query=url,
+        )
+    return None
 
 
 def _format_time(seconds: float) -> str:
@@ -3810,6 +3937,43 @@ async def djoff_cmd(interaction: discord.Interaction):
     else:
         await interaction.response.send_message(
             "No DJ role was set.", ephemeral=True
+        )
+
+
+@tree.command(name="autoplay", description="Toggle autoplay — keep playing related songs when the queue ends.")
+@app_commands.describe(state="Turn autoplay on or off (omit to see the current setting)")
+@app_commands.choices(state=[
+    app_commands.Choice(name="on", value="on"),
+    app_commands.Choice(name="off", value="off"),
+])
+async def autoplay_cmd(
+    interaction: discord.Interaction, state: app_commands.Choice[str] | None = None
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    current = guild_autoplay.get(interaction.guild.id, True)  # default ON
+    if state is None:
+        await interaction.response.send_message(
+            f"📻 Autoplay is currently **{'on' if current else 'off'}**. "
+            f"When the queue ends, I {'keep playing related tracks' if current else 'stop'}. "
+            f"Use `/autoplay state:on|off` to change it.",
+            ephemeral=True,
+        )
+        return
+    if not await _require_dj(interaction):
+        return
+    new_val = state.value == "on"
+    guild_autoplay[interaction.guild.id] = new_val
+    save_config()
+    if new_val:
+        await interaction.response.send_message(
+            "📻 Autoplay **on** — when the queue runs out, I'll keep the vibe going "
+            "with related tracks. `/stop` or `/autoplay state:off` to end it."
+        )
+    else:
+        await interaction.response.send_message(
+            "📻 Autoplay **off** — I'll stop once the queue is empty."
         )
 
 
