@@ -1798,6 +1798,24 @@ EQ_PRESETS: dict[str, str] = {
 # treated as a failed stream and re-resolved once. Covers 403s / expired URLs.
 MUSIC_EARLY_DEATH_SECONDS = 8
 
+# How many autoplay tracks to keep prefetched & resolved in the background.
+AUTOPLAY_BUFFER = 3
+
+
+def _normalize_title(title: str) -> str:
+    """Collapse a track title to a comparable key so re-uploads / covers of the
+    same song dedup together (different video IDs, near-identical titles)."""
+    t = (title or "").lower()
+    # Drop bracketed noise and common qualifiers.
+    t = re.sub(r"[\(\[].*?[\)\]]", " ", t)
+    t = re.sub(
+        r"\b(official|music|video|audio|lyric[s]?|hd|hq|mv|m/v|full|"
+        r"visualizer|remaster(ed)?|extended|version|ver|feat\.?|ft\.?)\b",
+        " ", t,
+    )
+    t = re.sub(r"[^a-z0-9]+", " ", t)        # strip punctuation
+    return " ".join(t.split())               # collapse whitespace
+
 
 def _ffmpeg_before_options(track: "Track") -> str:
     """Base reconnect flags + the User-Agent yt-dlp wants for this stream.
@@ -1888,14 +1906,15 @@ class GuildMusic:
         # Set right before an intentional voice.stop() (skip/restart/stop/jump)
         # so _after_play knows the early end was deliberate, not a failed stream.
         self._expect_stop: bool = False
-        # Autoplay (radio): seed off the last track that played, and remember
-        # recent video IDs so the radio doesn't loop the same handful of songs.
+        # Autoplay (radio): seed off the last track that played. Remember recent
+        # video IDs AND normalized titles — re-uploads of the same song have
+        # different IDs, so title dedup stops "same song, different uploader".
         self._last_played: Track | None = None
-        self._recent_ids: deque[str] = deque(maxlen=80)
-        # Prefetched, fully-resolved next autoplay track + the task fetching it,
-        # so the radio plays instantly when the current song ends instead of
-        # stalling on a fetch+resolve after the gap.
-        self._next_autoplay: Track | None = None
+        self._recent_ids: deque[str] = deque(maxlen=120)
+        self._recent_titles: deque[str] = deque(maxlen=120)
+        # A small buffer of prefetched, fully-resolved autoplay tracks so the
+        # radio plays instantly on track end (and survives quick skips).
+        self._autoplay_buffer: deque[Track] = deque()
         self._prefetch_task: asyncio.Task | None = None
         # Consecutive autoplay tracks that failed to resolve. Breaks the
         # fetch→fail→fetch loop when YouTube keeps handing back junk.
@@ -2059,28 +2078,36 @@ class GuildMusic:
             track.title = resolved.title
         return True
 
+    def _autoplay_exclusions(self) -> tuple[set[str], set[str]]:
+        """Video IDs and normalized titles to avoid when picking radio tracks —
+        recently played PLUS whatever's already buffered/queued."""
+        ids = set(self._recent_ids)
+        titles = set(self._recent_titles)
+        for t in list(self._autoplay_buffer) + list(self.queue):
+            vid = _youtube_video_id(t.webpage_url)
+            if vid:
+                ids.add(vid)
+            titles.add(_normalize_title(t.title))
+        if self._last_played:
+            titles.add(_normalize_title(self._last_played.title))
+        return ids, titles
+
     async def _try_autoplay(self) -> Track | None:
         """When the queue empties, return a related track to keep playing — if
-        autoplay is enabled. Uses the background-prefetched track (instant) when
-        available, awaits an in-flight prefetch with a short timeout, and only
-        falls back to a fresh live fetch if both miss."""
+        autoplay is enabled. Pops the prefetched buffer (instant) when stocked,
+        waits briefly for an in-flight prefetch, else fetches one live."""
         if not guild_autoplay.get(self.guild_id, True):
             return None
-        # Bail out of a persistent fetch→fail loop instead of hammering YouTube.
         if self._autoplay_fail_streak >= 3:
             print(f"[music guild={self.guild_id}] autoplay giving up after "
                   f"{self._autoplay_fail_streak} consecutive failures")
             return None
 
-        # Already prefetched → instant.
-        if self._next_autoplay is not None:
-            nxt = self._next_autoplay
-            self._next_autoplay = None
-            return nxt
+        # Buffered → instant.
+        if self._autoplay_buffer:
+            return self._autoplay_buffer.popleft()
 
-        # Prefetch in flight (common when the user skips mid-song before the
-        # background fetch finished). Wait for it briefly instead of starting
-        # a duplicate live fetch — and grab its result if it lands in time.
+        # Prefetch in flight (e.g. user skipped before it finished). Wait briefly.
         if self._prefetch_task and not self._prefetch_task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(self._prefetch_task), timeout=6.0)
@@ -2088,17 +2115,17 @@ class GuildMusic:
                 pass
             except Exception as e:
                 print(f"[music guild={self.guild_id}] prefetch await error: {e}")
-            if self._next_autoplay is not None:
-                nxt = self._next_autoplay
-                self._next_autoplay = None
-                return nxt
+            if self._autoplay_buffer:
+                return self._autoplay_buffer.popleft()
 
+        # Live fallback.
         seed = self._last_played
         if seed is None:
             return None
         try:
+            ids, titles = self._autoplay_exclusions()
             return await fetch_autoplay_track(
-                seed, set(self._recent_ids),
+                seed, ids, titles,
                 requester_id=bot.user.id if bot.user else 0,
                 requester_name="Autoplay",
             )
@@ -2110,53 +2137,57 @@ class GuildMusic:
         if self._prefetch_task and not self._prefetch_task.done():
             self._prefetch_task.cancel()
         self._prefetch_task = None
-        self._next_autoplay = None
+        self._autoplay_buffer.clear()
 
     def _maybe_prefetch_autoplay(self) -> None:
-        """Kick off a background fetch+resolve of the next autoplay track while
-        the current one plays, so it's ready to fire instantly when this ends."""
+        """Top up the prefetch buffer in the background while a track plays, so
+        the radio fires instantly and a quick skip still lands on a fresh song."""
         if not guild_autoplay.get(self.guild_id, True):
             return
         if self.loop_mode != "off":
             return  # looping won't fall through to autoplay
         if self.queue:
             return  # real tracks are queued; no autoplay needed yet
-        if self._next_autoplay is not None:
-            return  # already have one ready
+        if len(self._autoplay_buffer) >= AUTOPLAY_BUFFER:
+            return  # buffer full
         if self._prefetch_task and not self._prefetch_task.done():
-            return  # already fetching
+            return  # already topping up
         if self._last_played is None:
             return
         self._prefetch_task = bot.loop.create_task(self._prefetch_autoplay())
 
     async def _prefetch_autoplay(self) -> None:
+        """Fill the buffer up to AUTOPLAY_BUFFER, de-duping by id AND title so the
+        same song (even re-uploaded by different channels) can't repeat."""
         seed = self._last_played
         if seed is None:
             return
         try:
-            lazy = await fetch_autoplay_track(
-                seed, set(self._recent_ids),
-                requester_id=bot.user.id if bot.user else 0,
-                requester_name="Autoplay",
-            )
-            if lazy is None or not lazy.resolve_query:
-                return
-            # Resolve the stream URL now so playback is instant later.
-            resolved = await resolve_track(
-                lazy.resolve_query, lazy.requester_id, lazy.requester_name
-            )
-            if resolved is None or not resolved.stream_url:
-                return
-            resolved.source_label = "Autoplay"
-            if lazy.title and lazy.title != "(untitled)":
-                resolved.title = lazy.title
-            # Only keep it if it's still wanted (queue still empty, autoplay on).
-            if (
-                guild_autoplay.get(self.guild_id, True)
-                and not self.queue
-                and self._next_autoplay is None
-            ):
-                self._next_autoplay = resolved
+            while len(self._autoplay_buffer) < AUTOPLAY_BUFFER:
+                if not guild_autoplay.get(self.guild_id, True) or self.queue:
+                    return
+                seed = self._last_played or seed
+                ids, titles = self._autoplay_exclusions()
+                lazy = await fetch_autoplay_track(
+                    seed, ids, titles,
+                    requester_id=bot.user.id if bot.user else 0,
+                    requester_name="Autoplay",
+                )
+                if lazy is None or not lazy.resolve_query:
+                    return  # nothing new to add right now
+                resolved = await resolve_track(
+                    lazy.resolve_query, lazy.requester_id, lazy.requester_name
+                )
+                if resolved is None or not resolved.stream_url:
+                    continue  # bad pick, try another
+                resolved.source_label = "Autoplay"
+                if lazy.title and lazy.title != "(untitled)":
+                    resolved.title = lazy.title
+                # Final dedup against the buffer (race-safe).
+                norm = _normalize_title(resolved.title)
+                if any(_normalize_title(t.title) == norm for t in self._autoplay_buffer):
+                    continue
+                self._autoplay_buffer.append(resolved)
         except Exception as e:
             print(f"[music guild={self.guild_id}] autoplay prefetch failed: {e}")
 
@@ -2243,13 +2274,17 @@ class GuildMusic:
         self._start_timer()
         self._cancel_idle_disconnect()
         self._autoplay_fail_streak = 0  # a track played → reset the failure guard
-        # Remember this as the autoplay seed + mark it recently played.
+        # Remember this as the autoplay seed + mark it recently played (by id
+        # AND normalized title, so re-uploads of the same song dedup too).
         self._last_played = next_track
         vid = _youtube_video_id(next_track.webpage_url)
         if vid and vid not in self._recent_ids:
             self._recent_ids.append(vid)
-        # Start prefetching the next radio track now so it's ready the instant
-        # this one ends (no mid-gap fetch+resolve stall).
+        norm = _normalize_title(next_track.title)
+        if norm and norm not in self._recent_titles:
+            self._recent_titles.append(norm)
+        # Top up the prefetch buffer now so the radio is ready the instant this
+        # ends (and a quick skip still lands on a fresh song).
         self._maybe_prefetch_autoplay()
         # Suppress the auto-announce when looping the same track, otherwise the
         # channel fills up with identical embeds.
@@ -3055,18 +3090,21 @@ def _is_video_entry(e: dict) -> bool:
 
 
 async def fetch_autoplay_track(
-    seed: "Track", exclude_ids: set[str], requester_id: int, requester_name: str
+    seed: "Track", exclude_ids: set[str], exclude_titles: set[str],
+    requester_id: int, requester_name: str,
 ) -> "Track | None":
     """Find a track related to `seed` to continue playback (radio).
 
     Primary: seed YouTube's Mix (RD<video_id>) and take the first entry not
-    already played. Fallback: search the seed's uploader/title. Returns a LAZY
-    Track (resolves its stream at play time), or None.
+    already played (skipping anything whose video id OR normalized title is in
+    the exclude sets — kills "same song, different uploader"). Fallback: search
+    the seed's title. Returns a LAZY Track (resolves at play time), or None.
     """
     if not YTDLP_AVAILABLE:
         return None
 
     seed_id = _youtube_video_id(seed.webpage_url)
+    exclude_titles = exclude_titles | {_normalize_title(seed.title)}
 
     def _flat(url_or_query: str):
         with yt_dlp.YoutubeDL(YTDL_FLAT_OPTS) as ydl:
@@ -3102,6 +3140,8 @@ async def fetch_autoplay_track(
         vid = e["id"]
         if vid == seed_id or vid in exclude_ids:
             continue
+        if _normalize_title(e.get("title") or "") in exclude_titles:
+            continue  # same song (re-upload / cover) — skip
         # Always build a canonical watch URL from the validated 11-char id, never
         # trust the raw entry url (which can be a channel/playlist URL).
         watch_url = f"https://www.youtube.com/watch?v={vid}"
