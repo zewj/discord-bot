@@ -178,6 +178,12 @@ YTDLP_PROXY = os.environ.get("YTDLP_PROXY")
 # Extra accounts allowed to use /restart and /update, in addition to the bot's
 # application owner (auto-detected at startup). Comma- or space-separated IDs.
 BOT_OWNER_ID = os.environ.get("BOT_OWNER_ID")
+# Where /update pulls the latest bot.py from (no git repo required). Defaults to
+# the raw GitHub main file; override with UPDATE_URL.
+UPDATE_URL = os.environ.get(
+    "UPDATE_URL",
+    "https://raw.githubusercontent.com/zewj/discord-bot/main/bot.py",
+)
 
 # ---------- Config ----------
 
@@ -3587,20 +3593,46 @@ def _is_owner(interaction: discord.Interaction) -> bool:
     return interaction.user.id in OWNER_IDS
 
 
-def _git_pull() -> tuple[bool, str]:
-    """git pull origin main in the bot's directory. Returns (ok, output)."""
-    repo = Path(__file__).resolve().parent
+def _normalize_raw_url(u: str) -> str:
+    """Turn a GitHub blob URL into a raw URL so /update fetches the file itself,
+    not the HTML page."""
+    u = u.strip()
+    if "github.com" in u and "/blob/" in u:
+        u = u.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+    return u
+
+
+async def _fetch_update(url: str) -> tuple[bool, str]:
+    """Download the new bot.py, validate it compiles, back up the current file,
+    and write it in. Returns (ok, message). No git repo required."""
+    url = _normalize_raw_url(url)
     try:
-        result = subprocess.run(
-            ["git", "pull", "origin", "main"],
-            cwd=repo, capture_output=True, text=True, timeout=90,
-        )
-        out = (result.stdout + result.stderr).strip()
-        return result.returncode == 0, out or "(no output)"
-    except FileNotFoundError:
-        return False, "git is not installed on the host."
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return False, f"download failed — HTTP {resp.status} from {url}"
+                content = await resp.text()
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, f"download failed: {type(e).__name__}: {e}"
+
+    if len(content) < 1000 or "import discord" not in content:
+        return False, "that URL didn't return a valid bot.py (too short / wrong file)."
+
+    # Compile-check BEFORE replacing so a broken download can't brick the bot.
+    try:
+        compile(content, "bot.py", "exec")
+    except SyntaxError as e:
+        return False, f"downloaded file has a syntax error (not applied): {e}"
+
+    path = Path(__file__).resolve()
+    try:
+        backup = path.with_name(path.name + ".bak")
+        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        path.write_text(content, encoding="utf-8")
+    except Exception as e:
+        return False, f"couldn't write the file: {type(e).__name__}: {e}"
+    return True, f"updated bot.py from {url} ({len(content):,} bytes; backup at {backup.name})"
 
 
 def _restart_process() -> None:
@@ -3940,30 +3972,20 @@ async def restart_cmd(interaction: discord.Interaction):
     _restart_process()
 
 
-@tree.command(name="update", description="Pull the latest code from GitHub (main) and restart (owner only).")
-async def update_cmd(interaction: discord.Interaction):
+@tree.command(name="update", description="Download the latest bot.py and restart (owner only).")
+@app_commands.describe(url="Where to pull bot.py from (optional — defaults to the configured URL)")
+async def update_cmd(interaction: discord.Interaction, url: str | None = None):
     if not _is_owner(interaction):
         await interaction.response.send_message(
             "Only the bot owner can update me.", ephemeral=True
         )
         return
     await interaction.response.defer(ephemeral=True)
-    ok, output = await asyncio.to_thread(_git_pull)
-    tail = output[-1500:]
+    ok, msg = await _fetch_update(url or UPDATE_URL)
     if not ok:
-        await interaction.followup.send(
-            f"❌ `git pull` failed:\n```\n{tail}\n```", ephemeral=True
-        )
+        await interaction.followup.send(f"❌ Update failed: {msg}", ephemeral=True)
         return
-    if "Already up to date" in output or "Already up-to-date" in output:
-        await interaction.followup.send(
-            f"✅ Already on the latest commit — nothing to update.\n```\n{tail}\n```",
-            ephemeral=True,
-        )
-        return
-    await interaction.followup.send(
-        f"✅ Pulled latest from `main`. Restarting…\n```\n{tail}\n```", ephemeral=True
-    )
+    await interaction.followup.send(f"✅ {msg}\nRestarting…", ephemeral=True)
     await asyncio.sleep(1.0)
     _restart_process()
 
