@@ -98,8 +98,8 @@ python bot.py
   - **DJ role** (optional): run `/dj role:@DJ` to lock control actions to that role. Anyone with Manage Server bypasses it. `/play`, `/queue`, and `/nowplaying` stay open to everyone. `/djoff` removes the lock. With no DJ role set, controls are open to all (default)
   - **Alone & vote rules** (always on, layered on top of the DJ system): if you're the **only listener** in the voice channel with the bot, every control works instantly — no DJ role and no vote required. With other people in the channel, `/skip` and `/leave` need a **strict majority vote** from the listeners (DJ-role holders and Manage-Server staff still bypass the vote). Votes auto-prune when listeners leave, so a quorum can't get stuck
   - **Autoplay (radio)**: on by default — when the queue runs dry, the bot finds a related track (seeded off YouTube's Mix for the last song) and keeps playing, drifting naturally and avoiding recent repeats. `/autoplay state:off` to make it stop at the end of the queue instead; `/autoplay` shows the current setting. `/stop` and `/leave` always end it
-  - **Auto-pause**: if everyone leaves and the bot is alone, playback pauses automatically; it resumes when someone rejoins (a manual `/pause` is left untouched). If the channel stays empty, the bot disconnects after 5 minutes idle
-  - Auto-disconnects after 5 minutes idle
+  - **Auto-pause**: if everyone leaves and the bot is alone, playback pauses automatically; it resumes when someone rejoins (a manual `/pause` is left untouched)
+  - **24/7 mode** (on by default): the bot stays in the voice channel even when nothing's playing or the channel is empty — it never auto-leaves. Turn it off with `/247 state:off` to restore the old behaviour (disconnect after 5 minutes idle/empty). `/leave` always disconnects regardless
 
 ## Slash commands
 
@@ -129,6 +129,7 @@ python bot.py
 | `/dj`     | Set the DJ role (only it can control playback), or show the current one (Manage Channels to set) |
 | `/djoff`  | Clear the DJ role so everyone can control playback again (Manage Channels) |
 | `/autoplay` | Toggle autoplay (keep playing related songs when the queue ends); default on |
+| `/247`    | Toggle 24/7 mode (stay in the voice channel even when idle/empty); default on |
 
 `/mood` accepts a `scope` arg:
 - `server` (default) — applies to the whole guild (requires Manage Channels)

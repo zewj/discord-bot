@@ -780,6 +780,7 @@ convo_moods: dict[str, str] = {}          # conversation_key -> mood
 convo_overrides_touched: dict[str, float] = {}  # last time a convo override was used
 dj_roles: dict[int, int] = {}             # guild_id -> role_id (music control gate)
 guild_autoplay: dict[int, bool] = {}      # guild_id -> autoplay on/off (default on)
+guild_247: dict[int, bool] = {}           # guild_id -> stay in VC 24/7 (default on)
 
 cleanup_runs = 0
 
@@ -788,7 +789,7 @@ cleanup_runs = 0
 
 def load_config():
     global auto_channels, guild_moods, convo_moods, convo_overrides_touched, dj_roles
-    global guild_autoplay
+    global guild_autoplay, guild_247
     if not CONFIG_PATH.exists():
         return
     try:
@@ -808,6 +809,7 @@ def load_config():
         }
         dj_roles      = {int(g): int(r) for g, r in data.get("dj_roles", {}).items()}
         guild_autoplay = {int(g): bool(v) for g, v in data.get("guild_autoplay", {}).items()}
+        guild_247 = {int(g): bool(v) for g, v in data.get("guild_247", {}).items()}
     except Exception as e:
         print(f"Failed to load config: {e}")
 
@@ -827,6 +829,7 @@ def save_config():
             "convo_overrides_touched": convo_overrides_touched,
             "dj_roles":      {str(g): r for g, r in dj_roles.items()},
             "guild_autoplay": {str(g): v for g, v in guild_autoplay.items()},
+            "guild_247": {str(g): v for g, v in guild_247.items()},
         }, indent=2))
     except Exception as e:
         print(f"Failed to save config: {e}")
@@ -2450,6 +2453,9 @@ class GuildMusic:
 
     def _schedule_idle_disconnect(self) -> None:
         self._cancel_idle_disconnect()
+        # 24/7 mode: never auto-leave for being idle or alone.
+        if guild_247.get(self.guild_id, True):
+            return
         self._idle_task = bot.loop.create_task(self._idle_disconnect())
 
     def _cancel_idle_disconnect(self) -> None:
@@ -4098,6 +4104,51 @@ async def autoplay_cmd(
     else:
         await interaction.response.send_message(
             "📻 Autoplay **off** — I'll stop once the queue is empty."
+        )
+
+
+@tree.command(name="247", description="Toggle 24/7 mode — stay in the voice channel even when idle/empty.")
+@app_commands.describe(state="Turn 24/7 on or off (omit to see the current setting)")
+@app_commands.choices(state=[
+    app_commands.Choice(name="on", value="on"),
+    app_commands.Choice(name="off", value="off"),
+])
+async def stay247_cmd(
+    interaction: discord.Interaction, state: app_commands.Choice[str] | None = None
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    current = guild_247.get(interaction.guild.id, True)  # default ON
+    if state is None:
+        await interaction.response.send_message(
+            f"🕒 24/7 mode is **{'on' if current else 'off'}**. "
+            f"When idle or alone I {'stay in the channel' if current else 'leave after 5 min'}. "
+            f"Use `/247 state:on|off` to change it.",
+            ephemeral=True,
+        )
+        return
+    if not await _require_dj(interaction):
+        return
+    new_val = state.value == "on"
+    guild_247[interaction.guild.id] = new_val
+    save_config()
+    if new_val:
+        # Stop any pending idle-disconnect for the active player.
+        music = guild_music.get(interaction.guild.id)
+        if music:
+            music._cancel_idle_disconnect()
+        await interaction.response.send_message(
+            "🕒 24/7 mode **on** — I'll stay in voice even when nothing's playing or "
+            "the channel's empty. `/leave` to make me leave, or `/247 state:off`."
+        )
+    else:
+        # Re-arm the idle timer if there's currently nothing to play.
+        music = guild_music.get(interaction.guild.id)
+        if music and music.voice and music.voice.is_connected() and not music.is_active():
+            music._schedule_idle_disconnect()
+        await interaction.response.send_message(
+            "🕒 24/7 mode **off** — I'll leave after 5 minutes of idle/empty."
         )
 
 
