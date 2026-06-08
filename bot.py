@@ -1637,6 +1637,17 @@ async def on_voice_state_update(
     music.skip_votes &= listener_ids
     music.leave_votes &= listener_ids
 
+    if not listener_ids:
+        # Everyone left — pause and arm the idle-disconnect so we don't sit
+        # paused in an empty channel forever.
+        if music.auto_pause_if_empty():
+            music._schedule_idle_disconnect()
+    else:
+        # Someone's (back) in the channel — resume if we auto-paused, and cancel
+        # the empty-channel disconnect timer.
+        if music.auto_resume_if_returned():
+            music._cancel_idle_disconnect()
+
 
 # ---------- Music playback (voice + yt-dlp + ffmpeg) ----------
 
@@ -1741,6 +1752,9 @@ class GuildMusic:
         # skip_votes reset on track change; both pruned to current listeners.
         self.skip_votes: set[int] = set()
         self.leave_votes: set[int] = set()
+        # True when playback was auto-paused because the channel emptied out, so
+        # we know to auto-resume (and not clobber a manual pause) when it refills.
+        self._auto_paused: bool = False
 
     # ---- state queries ----
 
@@ -1781,6 +1795,7 @@ class GuildMusic:
             return False
         self.voice.pause()
         self._pause_timer()
+        self._auto_paused = False  # explicit user pause overrides auto-pause state
         return True
 
     def resume(self) -> bool:
@@ -1788,6 +1803,7 @@ class GuildMusic:
             return False
         self.voice.resume()
         self._resume_timer()
+        self._auto_paused = False
         return True
 
     # ---- listener helpers (for vote / solo control) ----
@@ -1802,6 +1818,34 @@ class GuildMusic:
         """True if `member` is the only human in the bot's voice channel."""
         humans = self.voice_humans()
         return len(humans) == 1 and humans[0].id == member.id
+
+    def auto_pause_if_empty(self) -> bool:
+        """Pause playback when no humans remain in the channel. Returns True if
+        it just auto-paused. Leaves a manually-paused track alone."""
+        if self.voice_humans():
+            return False
+        if self.is_playing():
+            self.voice.pause()
+            self._pause_timer()
+            self._auto_paused = True
+            print(f"[music guild={self.guild_id}] channel empty — auto-paused")
+            return True
+        return False
+
+    def auto_resume_if_returned(self) -> bool:
+        """Resume a track that we auto-paused, now that a human is back. Returns
+        True if it just resumed. No-op for manual pauses."""
+        if not self._auto_paused:
+            return False
+        if not self.voice_humans():
+            return False
+        self._auto_paused = False
+        if self.is_paused():
+            self.voice.resume()
+            self._resume_timer()
+            print(f"[music guild={self.guild_id}] listener returned — auto-resumed")
+            return True
+        return False
 
     # ---- voice connection ----
 
@@ -2151,7 +2195,9 @@ class GuildMusic:
             await asyncio.sleep(MUSIC_IDLE_TIMEOUT)
         except asyncio.CancelledError:
             return
-        if not self.is_active() and not self.queue:
+        # Nothing queued/playing, OR the channel is still empty (e.g. we
+        # auto-paused when everyone left and nobody came back) → disconnect.
+        if (not self.is_active() and not self.queue) or not self.voice_humans():
             print(f"[music guild={self.guild_id}] idle {MUSIC_IDLE_TIMEOUT}s — disconnecting")
             await self.leave()
 
