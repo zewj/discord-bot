@@ -49,6 +49,13 @@ Required by the `/play` voice commands. Without it, the music commands log a cle
 
 The Python side (`yt-dlp`) is installed automatically via `requirements.txt`.
 
+**Datacenter/VPS hosts (Contabo, OVH, Hetzner, etc.):** YouTube flags many datacenter IP ranges and serves them a stripped format list, which shows up as `ERROR: Requested format is not available`. The fix is to feed yt-dlp **cookies** from a logged-in YouTube account so requests look authenticated:
+
+1. Install a "Get cookies.txt" browser extension, log into YouTube, export `cookies.txt` (Netscape format).
+2. Upload it to the host and set `YTDLP_COOKIES=/path/to/cookies.txt` — OR, if the bot runs on a desktop with a browser, set `YTDLP_COOKIES_FROM_BROWSER=chrome` (or firefox/edge).
+
+The startup banner prints `yt-dlp cookies: ON/OFF` so you can confirm it's picked up. If cookies still aren't enough, the IP is hard-blocked and you'd need a residential proxy.
+
 ### 6. (Optional) Spotify credentials for Spotify-link parsing
 
 Without these, `/play` still works for YouTube, SoundCloud, and Apple Music URLs — but pasting a Spotify link returns "couldn't resolve". With them, Spotify URLs are converted to a `"Title Artist"` YouTube search and played from there (Spotify's API doesn't expose audio streams, so this is the only legal route).

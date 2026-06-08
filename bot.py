@@ -166,6 +166,12 @@ YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 # read public track metadata via the Client Credentials flow.
 SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
+# Optional but strongly recommended on datacenter/VPS hosts (Contabo, OVH, etc.)
+# where YouTube serves a stripped format list to flagged IPs. Point to a
+# Netscape-format cookies.txt exported from a logged-in YouTube account, or set
+# YTDLP_COOKIES_FROM_BROWSER to a browser name (chrome/firefox/edge/…).
+YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES")
+YTDLP_COOKIES_FROM_BROWSER = os.environ.get("YTDLP_COOKIES_FROM_BROWSER")
 
 # ---------- Config ----------
 
@@ -1620,6 +1626,12 @@ async def on_ready():
         if not YTDLP_AVAILABLE:
             missing.append("yt-dlp(pip)")
         print(f"  music: DISABLED — missing {', '.join(missing)}")
+    elif YTDLP_COOKIES or YTDLP_COOKIES_FROM_BROWSER:
+        src = YTDLP_COOKIES or f"browser:{YTDLP_COOKIES_FROM_BROWSER}"
+        print(f"  yt-dlp cookies: ON ({src})")
+    else:
+        print("  yt-dlp cookies: OFF — set YTDLP_COOKIES on flagged/datacenter IPs "
+              "if you hit 'format not available'")
     print("=" * 60)
 
 
@@ -1713,7 +1725,13 @@ PROGRESS_UPDATE_INTERVAL = 8      # seconds between live progress-bar message ed
 PLAYLIST_MAX = 50                 # cap tracks pulled from one playlist/album
 
 YTDL_OPTS = {
-    "format": "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
+    # Permissive base selector + format_sort for quality preference. Hard ext/
+    # codec filters (e.g. bestaudio[ext=webm]) can match NOTHING on flagged
+    # datacenter IPs that get a stripped format list → "Requested format is not
+    # available". bestaudio*/best almost always matches if any audio exists, and
+    # format_sort still prefers opus/webm/m4a when they're offered.
+    "format": "bestaudio/bestaudio*/best",
+    "format_sort": ["acodec:opus", "ext:webm", "ext:m4a", "acodec:aac"],
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch1",
@@ -1721,6 +1739,7 @@ YTDL_OPTS = {
     "noplaylist": True,
     "extract_flat": False,
     "skip_download": True,
+    "ignoreerrors": False,
     # NOTE: we deliberately do NOT pin extractor_args player_client. Pinning a
     # fixed client set (e.g. tv/web_safari) makes yt-dlp abort with "This video
     # is DRM protected" on videos that only expose DRM formats to those clients.
@@ -1728,6 +1747,14 @@ YTDL_OPTS = {
     # back to a client with clean formats. 403s are handled separately by
     # forwarding yt-dlp's http_headers to ffmpeg (see _ffmpeg_before_options).
 }
+
+# Cookies dramatically improve reliability on flagged datacenter IPs (YouTube
+# serves the full format list to "logged-in" requests). Applied to every yt-dlp
+# call when configured.
+if YTDLP_COOKIES:
+    YTDL_OPTS["cookiefile"] = YTDLP_COOKIES
+elif YTDLP_COOKIES_FROM_BROWSER:
+    YTDL_OPTS["cookiesfrombrowser"] = (YTDLP_COOKIES_FROM_BROWSER,)
 
 # Fast, shallow extraction for playlists/sets — pulls the entry list without
 # resolving each track's stream URL (that happens lazily, just before play).
