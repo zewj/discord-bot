@@ -2005,14 +2005,32 @@ class GuildMusic:
     async def _try_autoplay(self) -> Track | None:
         """When the queue empties, return a related track to keep playing — if
         autoplay is enabled. Uses the background-prefetched track (instant) when
-        available, else fetches one live as a fallback."""
+        available, awaits an in-flight prefetch with a short timeout, and only
+        falls back to a fresh live fetch if both miss."""
         if not guild_autoplay.get(self.guild_id, True):
             return None
-        # Prefetched while the previous track was still playing → instant.
+
+        # Already prefetched → instant.
         if self._next_autoplay is not None:
             nxt = self._next_autoplay
             self._next_autoplay = None
             return nxt
+
+        # Prefetch in flight (common when the user skips mid-song before the
+        # background fetch finished). Wait for it briefly instead of starting
+        # a duplicate live fetch — and grab its result if it lands in time.
+        if self._prefetch_task and not self._prefetch_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(self._prefetch_task), timeout=6.0)
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                print(f"[music guild={self.guild_id}] prefetch await error: {e}")
+            if self._next_autoplay is not None:
+                nxt = self._next_autoplay
+                self._next_autoplay = None
+                return nxt
+
         seed = self._last_played
         if seed is None:
             return None
