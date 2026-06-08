@@ -95,7 +95,8 @@ python bot.py
   - **Apple Music** — paste a single-track URL (`music.apple.com/…?i=…`); no credentials needed (uses iTunes Search API)
   - **Playlists & albums** — paste a YouTube playlist, SoundCloud set, Spotify playlist/album, or Apple Music album URL to queue all of it at once (capped at 50 tracks). Playlist tracks resolve lazily — each one's stream is fetched just before it plays, so big queues start instantly and stream URLs never go stale. (Apple Music *curated playlists* aren't supported — not exposed by the iTunes API — but albums are.)
   - **Now-playing embed** has a **live progress bar** that updates as the track plays, plus ⏮ ⏯ ⏭ ⏹ / 🔁 🔀 buttons
-  - **DJ role** (optional): run `/dj role:@DJ` to lock the control actions (skip, stop, pause, loop, volume, shuffle, remove, clear, jump, leave — slash commands *and* the embed buttons) to that role. Anyone with Manage Server bypasses it. `/play`, `/queue`, and `/nowplaying` stay open to everyone. `/djoff` removes the lock. With no DJ role set, controls are open to all (default)
+  - **DJ role** (optional): run `/dj role:@DJ` to lock control actions to that role. Anyone with Manage Server bypasses it. `/play`, `/queue`, and `/nowplaying` stay open to everyone. `/djoff` removes the lock. With no DJ role set, controls are open to all (default)
+  - **Alone & vote rules** (always on, layered on top of the DJ system): if you're the **only listener** in the voice channel with the bot, every control works instantly — no DJ role and no vote required. With other people in the channel, `/skip` and `/leave` need a **strict majority vote** from the listeners (DJ-role holders and Manage-Server staff still bypass the vote). Votes auto-prune when listeners leave, so a quorum can't get stuck
   - Auto-disconnects after 5 minutes idle
 
 ## Slash commands

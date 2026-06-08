@@ -1612,6 +1612,32 @@ async def on_message(message: discord.Message):
     await handle_chat(message, content)
 
 
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+):
+    """Prune skip/leave votes when listeners leave the bot's channel so a
+    quorum can't get stuck after someone walks out mid-vote."""
+    if member.bot:
+        return
+    if before.channel == after.channel:
+        return  # mute / deafen / camera toggle — not a join/leave
+    guild = member.guild
+    if guild is None:
+        return
+    music = guild_music.get(guild.id)
+    if music is None or music.voice is None or not music.voice.is_connected():
+        return
+    if before.channel != music.voice.channel and after.channel != music.voice.channel:
+        return  # state change in some unrelated channel
+
+    listener_ids = {m.id for m in music.voice_humans()}
+    music.skip_votes &= listener_ids
+    music.leave_votes &= listener_ids
+
+
 # ---------- Music playback (voice + yt-dlp + ffmpeg) ----------
 
 FFMPEG_PATH = shutil.which("ffmpeg")
@@ -1711,6 +1737,10 @@ class GuildMusic:
         # Live progress bar: the now-playing message + the task editing it.
         self._now_playing_msg: discord.Message | None = None
         self._progress_task: asyncio.Task | None = None
+        # Democratic control: user IDs who've voted to skip / make the bot leave.
+        # skip_votes reset on track change; both pruned to current listeners.
+        self.skip_votes: set[int] = set()
+        self.leave_votes: set[int] = set()
 
     # ---- state queries ----
 
@@ -1759,6 +1789,19 @@ class GuildMusic:
         self.voice.resume()
         self._resume_timer()
         return True
+
+    # ---- listener helpers (for vote / solo control) ----
+
+    def voice_humans(self) -> list:
+        """Non-bot members currently in the bot's voice channel."""
+        if not self.voice or not self.voice.channel:
+            return []
+        return [m for m in self.voice.channel.members if not m.bot]
+
+    def is_alone_with(self, member) -> bool:
+        """True if `member` is the only human in the bot's voice channel."""
+        humans = self.voice_humans()
+        return len(humans) == 1 and humans[0].id == member.id
 
     # ---- voice connection ----
 
@@ -1853,6 +1896,7 @@ class GuildMusic:
                     return
                 next_track = self.queue.popleft()
                 self.current = next_track
+                self.skip_votes.clear()  # fresh track → fresh skip vote
 
         if self.voice is None or not self.voice.is_connected():
             self.current = None
@@ -2000,6 +2044,8 @@ class GuildMusic:
     async def stop_and_clear(self) -> None:
         self._cancel_progress_task()
         self._now_playing_msg = None
+        self.skip_votes.clear()
+        self.leave_votes.clear()
         async with self._lock:
             self.queue.clear()
             self.current = None
@@ -2011,6 +2057,8 @@ class GuildMusic:
         self._cancel_idle_disconnect()
         self._cancel_progress_task()
         self._now_playing_msg = None
+        self.skip_votes.clear()
+        self.leave_votes.clear()
         async with self._lock:
             self.queue.clear()
             self.current = None
@@ -2630,13 +2678,17 @@ class MusicControls(discord.ui.View):
                 "Music only works in servers.", ephemeral=True
             )
             return None
-        # Buttons are all control actions — gate them behind the DJ role.
-        if not member_is_dj(interaction.user, interaction.guild_id):
-            await interaction.response.send_message(
-                _dj_denied_msg(interaction.guild_id), ephemeral=True
-            )
-            return None
-        return guild_music.get(interaction.guild_id)
+        music = guild_music.get(interaction.guild_id)
+        # Non-vote buttons (⏮ ⏯ ⏹ 🔁 🔀) are gated like the slash controls:
+        # DJ-role/staff, or anyone alone in the channel with the bot.
+        if member_is_dj(interaction.user, interaction.guild_id):
+            return music
+        if music and music.is_alone_with(interaction.user):
+            return music
+        await interaction.response.send_message(
+            _dj_denied_msg(interaction.guild_id), ephemeral=True
+        )
+        return None
 
     @discord.ui.button(emoji="⏮", style=discord.ButtonStyle.secondary, row=0)
     async def rewind_button(
@@ -2671,15 +2723,22 @@ class MusicControls(discord.ui.View):
     async def skip_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        music = await self._music(interaction)
-        if music is None:
+        # Skip is vote-enabled, so bypass the plain DJ gate in _music and run
+        # the same vote logic the /skip command uses.
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Music only works in servers.", ephemeral=True
+            )
             return
-        if not music.is_active():
+        music = guild_music.get(interaction.guild_id)
+        if not music or not music.is_active():
             await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        if not await _vote_gate(interaction, music, "skip"):
             return
         skipped = await music.skip()
         title = skipped.title if skipped else "track"
-        await interaction.response.send_message(f"⏭ Skipped **{title}**.", ephemeral=True)
+        await interaction.response.send_message(f"⏭ Skipped **{title}**.")
 
     @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger, row=0)
     async def stop_button(
@@ -2763,24 +2822,88 @@ def member_is_dj(member, guild_id: int) -> bool:
     return any(r.id == role_id for r in member.roles)
 
 
+def has_dj_authority(member, guild_id: int) -> bool:
+    """Stricter than member_is_dj: True only when the member has EXPLICIT
+    authority — staff, or the configured DJ role. Returns False when no DJ role
+    is set (so the alone/vote logic governs instead of blanket-allowing). Used
+    by the vote system to decide who skips the vote entirely.
+    """
+    if not isinstance(member, discord.Member):
+        return False
+    perms = member.guild_permissions
+    if perms.manage_channels or perms.manage_guild or perms.administrator:
+        return True
+    role_id = dj_roles.get(guild_id)
+    return bool(role_id) and any(r.id == role_id for r in member.roles)
+
+
 def _dj_denied_msg(guild_id: int) -> str:
     role_id = dj_roles.get(guild_id)
     mention = f"<@&{role_id}>" if role_id else "DJ"
     return (
-        f"🎧 You need the {mention} role (or Manage Server) to control playback. "
-        f"You can still use `/play`, `/queue`, and `/nowplaying`."
+        f"🎧 You need the {mention} role (or Manage Server), or to be alone in the "
+        f"voice channel with me, to control playback. You can still use `/play`, "
+        f"`/queue`, and `/nowplaying`."
     )
 
 
 async def _require_dj(interaction: discord.Interaction) -> bool:
-    """Gate a control command. Returns True if allowed; otherwise sends an
-    ephemeral denial and returns False. Call after the guild-None check."""
+    """Gate a (non-vote) control command. Allows DJ-role/staff, OR anyone who is
+    alone in the voice channel with the bot. Otherwise sends an ephemeral denial
+    and returns False. Call after the guild-None check."""
     if interaction.guild is None:
         return True
     if member_is_dj(interaction.user, interaction.guild.id):
         return True
+    music = guild_music.get(interaction.guild.id)
+    if music and music.is_alone_with(interaction.user):
+        return True
     await interaction.response.send_message(
         _dj_denied_msg(interaction.guild.id), ephemeral=True
+    )
+    return False
+
+
+async def _vote_gate(interaction: discord.Interaction, music, action: str) -> bool:
+    """Gate for vote-enabled actions ('skip', 'leave').
+
+    Returns True when the action should run NOW (the caller then executes it and
+    sends its own response). Returns False when this function already responded —
+    either a vote was registered (public) or the user can't vote yet.
+
+    Bypasses: DJ-role/staff act instantly; a solo listener acts instantly.
+    Otherwise a strict majority of the humans in the voice channel must agree.
+    """
+    member = interaction.user
+    gid = interaction.guild_id
+
+    if has_dj_authority(member, gid):
+        return True
+
+    humans = music.voice_humans()
+    if len(humans) <= 1:
+        # Solo listener (or nobody else around) → no vote needed.
+        return True
+
+    listener_ids = {m.id for m in humans}
+    if member.id not in listener_ids:
+        await interaction.response.send_message(
+            f"Join the voice channel to vote to {action}.", ephemeral=True
+        )
+        return False
+
+    votes = music.skip_votes if action == "skip" else music.leave_votes
+    votes &= listener_ids          # drop anyone who left the channel
+    votes.add(member.id)
+    needed = len(humans) // 2 + 1  # strict majority
+
+    if len(votes) >= needed:
+        votes.clear()
+        return True
+
+    await interaction.response.send_message(
+        f"🗳️ Vote to **{action}** registered — **{len(votes)}/{needed}** needed. "
+        f"Others in the voice channel can run `/{action}` (or hit the button) to agree."
     )
     return False
 
@@ -3248,11 +3371,11 @@ async def skip_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
-    if not await _require_dj(interaction):
-        return
     music = guild_music.get(interaction.guild.id)
     if not music or not music.is_active():
         await interaction.response.send_message("Nothing playing.", ephemeral=True)
+        return
+    if not await _vote_gate(interaction, music, "skip"):
         return
     skipped = await music.skip()
     title = skipped.title if skipped else "current track"
@@ -3279,11 +3402,11 @@ async def leave_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
-    if not await _require_dj(interaction):
-        return
     music = guild_music.get(interaction.guild.id)
     if not music or music.voice is None or not music.voice.is_connected():
         await interaction.response.send_message("Not in a voice channel.", ephemeral=True)
+        return
+    if not await _vote_gate(interaction, music, "leave"):
         return
     await music.leave()
     await interaction.response.send_message("👋 Left voice.")
