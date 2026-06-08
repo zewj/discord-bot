@@ -1843,6 +1843,9 @@ class GuildMusic:
         # stalling on a fetch+resolve after the gap.
         self._next_autoplay: Track | None = None
         self._prefetch_task: asyncio.Task | None = None
+        # Consecutive autoplay tracks that failed to resolve. Breaks the
+        # fetch→fail→fetch loop when YouTube keeps handing back junk.
+        self._autoplay_fail_streak: int = 0
         # Set by stop/leave so the resulting _advance doesn't autoplay a new
         # track (which would undo the stop). Consumed on the next _advance.
         self._stopping: bool = False
@@ -2009,6 +2012,11 @@ class GuildMusic:
         falls back to a fresh live fetch if both miss."""
         if not guild_autoplay.get(self.guild_id, True):
             return None
+        # Bail out of a persistent fetch→fail loop instead of hammering YouTube.
+        if self._autoplay_fail_streak >= 3:
+            print(f"[music guild={self.guild_id}] autoplay giving up after "
+                  f"{self._autoplay_fail_streak} consecutive failures")
+            return None
 
         # Already prefetched → instant.
         if self._next_autoplay is not None:
@@ -2154,6 +2162,8 @@ class GuildMusic:
             if not ok:
                 print(f"[music guild={self.guild_id}] could not resolve "
                       f"{next_track.resolve_query!r}, skipping")
+                if next_track.source_label == "Autoplay":
+                    self._autoplay_fail_streak += 1
                 # Only advance if nothing else moved on in the meantime. Clear
                 # current first so loop=track can't infinitely retry a dead entry.
                 if self.current is next_track:
@@ -2178,6 +2188,7 @@ class GuildMusic:
 
         self._start_timer()
         self._cancel_idle_disconnect()
+        self._autoplay_fail_streak = 0  # a track played → reset the failure guard
         # Remember this as the autoplay seed + mark it recently played.
         self._last_played = next_track
         vid = _youtube_video_id(next_track.webpage_url)
@@ -2905,6 +2916,25 @@ def _youtube_video_id(url: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+_VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
+
+
+def _is_video_entry(e: dict) -> bool:
+    """True only for actual YouTube video entries. yt-dlp Mix/search results can
+    include channels and playlists — resolving those makes yt-dlp try to extract
+    the whole channel (huge → timeout), so they must be filtered out."""
+    ie = (e.get("ie_key") or e.get("extractor") or "").lower()
+    if "tab" in ie or "playlist" in ie or "channel" in ie or "user" in ie:
+        return False
+    vid = e.get("id") or ""
+    if not _VIDEO_ID_RE.fullmatch(vid):
+        return False  # channel IDs ("UC…", 24 chars) and playlist IDs fail this
+    url = (e.get("url") or e.get("webpage_url") or "").lower()
+    if any(bad in url for bad in ("/channel/", "/playlist", "/@", "/user/", "/c/")):
+        return False
+    return True
+
+
 async def fetch_autoplay_track(
     seed: "Track", exclude_ids: set[str], requester_id: int, requester_name: str
 ) -> "Track | None":
@@ -2934,9 +2964,9 @@ async def fetch_autoplay_track(
         except Exception as e:
             print(f"[autoplay] mix fetch failed: {e}")
 
-    # Fallback: search by uploader/title for something in the same vein.
+    # Fallback: search by title (then uploader) for something in the same vein.
     if not entries:
-        seed_terms = (seed.uploader or seed.title or "").strip()
+        seed_terms = (seed.title or seed.uploader or "").strip()
         if seed_terms:
             try:
                 info = await asyncio.wait_for(
@@ -2948,13 +2978,17 @@ async def fetch_autoplay_track(
                 print(f"[autoplay] fallback search failed: {e}")
 
     for e in entries:
-        vid = e.get("id")
-        if not vid or vid == seed_id or vid in exclude_ids:
+        if not _is_video_entry(e):
+            continue  # skip channel/playlist results that would timeout on resolve
+        vid = e["id"]
+        if vid == seed_id or vid in exclude_ids:
             continue
-        url = e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
+        # Always build a canonical watch URL from the validated 11-char id, never
+        # trust the raw entry url (which can be a channel/playlist URL).
+        watch_url = f"https://www.youtube.com/watch?v={vid}"
         return Track(
             stream_url=None,
-            webpage_url=f"https://www.youtube.com/watch?v={vid}",
+            webpage_url=watch_url,
             title=e.get("title") or "(untitled)",
             duration=int(e["duration"]) if e.get("duration") else None,
             requester_id=requester_id,
@@ -2962,7 +2996,7 @@ async def fetch_autoplay_track(
             thumbnail_url=e.get("thumbnail"),
             uploader=e.get("uploader") or e.get("channel"),
             source_label="Autoplay",
-            resolve_query=url,
+            resolve_query=watch_url,
         )
     return None
 
