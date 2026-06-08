@@ -143,6 +143,15 @@ python bot.py
 | `/djoff`  | Clear the DJ role so everyone can control playback again (Manage Channels) |
 | `/autoplay` | Toggle autoplay (keep playing related songs when the queue ends); default on |
 | `/247`    | Toggle 24/7 mode (stay in the voice channel even when idle/empty); default on |
+| `/restart`| **Owner only.** Restart the bot in place (re-execs the process) |
+| `/update` | **Owner only.** `git pull origin main` then restart — pulls the latest code from GitHub |
+
+### Owner commands (`/restart`, `/update`)
+
+`/restart` and `/update` are restricted to the **bot's application owner** (auto-detected at startup; override with `BOT_OWNER_ID=<your_discord_user_id>` if the app is team-owned). 
+
+- `/restart` re-execs the process in place — self-contained, doesn't rely on the host's restart policy.
+- `/update` runs `git pull origin main` in the bot's directory, then restarts to load the new code. Requires the bot to be running from a git clone of the repo with `origin` pointing at GitHub, and `git` installed on the host. If `requirements.txt` changed, restart again via your host so deps reinstall.
 
 `/mood` accepts a `scope` arg:
 - `server` (default) — applies to the whole guild (requires Manage Channels)

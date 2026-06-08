@@ -175,6 +175,9 @@ YTDLP_COOKIES_FROM_BROWSER = os.environ.get("YTDLP_COOKIES_FROM_BROWSER")
 # Last-resort fix for hard-blocked datacenter IPs: route yt-dlp through a proxy
 # (ideally residential). Format: http://user:pass@host:port  or  socks5://host:port
 YTDLP_PROXY = os.environ.get("YTDLP_PROXY")
+# Optional override for who may use /restart and /update. If unset, the bot's
+# application owner (auto-detected at startup) is used.
+BOT_OWNER_ID = os.environ.get("BOT_OWNER_ID")
 
 # ---------- Config ----------
 
@@ -1588,10 +1591,20 @@ async def handle_chat(message: discord.Message, content: str):
 
 # ---------- Discord events ----------
 
+OWNER_ID: int | None = int(BOT_OWNER_ID) if (BOT_OWNER_ID or "").isdigit() else None
+
+
 @bot.event
 async def on_ready():
+    global OWNER_ID
     load_config()
     load_memory()
+    if OWNER_ID is None:
+        try:
+            app = await bot.application_info()
+            OWNER_ID = app.owner.id
+        except Exception as e:
+            print(f"Could not determine bot owner: {e}")
     try:
         synced = await tree.sync()
         synced_n = len(synced)
@@ -3566,6 +3579,41 @@ def _check_manage(interaction: discord.Interaction) -> bool:
     )
 
 
+def _is_owner(interaction: discord.Interaction) -> bool:
+    return OWNER_ID is not None and interaction.user.id == OWNER_ID
+
+
+def _git_pull() -> tuple[bool, str]:
+    """git pull origin main in the bot's directory. Returns (ok, output)."""
+    repo = Path(__file__).resolve().parent
+    try:
+        result = subprocess.run(
+            ["git", "pull", "origin", "main"],
+            cwd=repo, capture_output=True, text=True, timeout=90,
+        )
+        out = (result.stdout + result.stderr).strip()
+        return result.returncode == 0, out or "(no output)"
+    except FileNotFoundError:
+        return False, "git is not installed on the host."
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _restart_process() -> None:
+    """Flush state and re-exec the bot process in place (self-contained restart;
+    doesn't depend on the host's restart policy)."""
+    try:
+        save_config()
+    except Exception:
+        pass
+    try:
+        save_memory()
+    except Exception:
+        pass
+    print("[restart] re-executing the bot process…")
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
 SCOPE_CHOICES = [
     app_commands.Choice(name="this channel/thread only", value="here"),
     app_commands.Choice(name="whole server (default)",   value="server"),
@@ -3873,6 +3921,47 @@ async def status_cmd(interaction: discord.Interaction):
             f"• DJ role: {dj_label}"
         )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@tree.command(name="restart", description="Restart the bot (owner only).")
+async def restart_cmd(interaction: discord.Interaction):
+    if not _is_owner(interaction):
+        await interaction.response.send_message(
+            "Only the bot owner can restart me.", ephemeral=True
+        )
+        return
+    await interaction.response.send_message("🔄 Restarting… back in a few seconds.")
+    # Let the reply flush over the network, then re-exec.
+    await asyncio.sleep(1.0)
+    _restart_process()
+
+
+@tree.command(name="update", description="Pull the latest code from GitHub (main) and restart (owner only).")
+async def update_cmd(interaction: discord.Interaction):
+    if not _is_owner(interaction):
+        await interaction.response.send_message(
+            "Only the bot owner can update me.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok, output = await asyncio.to_thread(_git_pull)
+    tail = output[-1500:]
+    if not ok:
+        await interaction.followup.send(
+            f"❌ `git pull` failed:\n```\n{tail}\n```", ephemeral=True
+        )
+        return
+    if "Already up to date" in output or "Already up-to-date" in output:
+        await interaction.followup.send(
+            f"✅ Already on the latest commit — nothing to update.\n```\n{tail}\n```",
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send(
+        f"✅ Pulled latest from `main`. Restarting…\n```\n{tail}\n```", ephemeral=True
+    )
+    await asyncio.sleep(1.0)
+    _restart_process()
 
 
 @tree.command(name="play", description="Play a track/playlist (URL or search) or an uploaded audio file.")
