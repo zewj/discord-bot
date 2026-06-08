@@ -1718,10 +1718,12 @@ YTDL_OPTS = {
     "noplaylist": True,
     "extract_flat": False,
     "skip_download": True,
-    # Prefer YouTube clients that hand back directly-fetchable stream URLs.
-    # The default rotation sometimes lands on android_vr, whose URLs 403 when
-    # ffmpeg fetches them with a mismatched User-Agent. These are sturdier.
-    "extractor_args": {"youtube": {"player_client": ["ios", "web_safari", "mweb", "tv"]}},
+    # NOTE: we deliberately do NOT pin extractor_args player_client. Pinning a
+    # fixed client set (e.g. tv/web_safari) makes yt-dlp abort with "This video
+    # is DRM protected" on videos that only expose DRM formats to those clients.
+    # Letting yt-dlp use its (auto-updated) default client rotation lets it fall
+    # back to a client with clean formats. 403s are handled separately by
+    # forwarding yt-dlp's http_headers to ffmpeg (see _ffmpeg_before_options).
 }
 
 # Fast, shallow extraction for playlists/sets — pulls the entry list without
