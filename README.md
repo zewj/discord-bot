@@ -148,7 +148,7 @@ python bot.py
 
 ### Owner commands (`/restart`, `/update`)
 
-`/restart` and `/update` are restricted to the **bot's application owner** (auto-detected at startup; override with `BOT_OWNER_ID=<your_discord_user_id>` if the app is team-owned). 
+`/restart` and `/update` are restricted to the **bot's application owner** (auto-detected at startup). To allow **additional accounts** (or if the app is team-owned and auto-detect misses), set `BOT_OWNER_ID` to one or more Discord user IDs, comma- or space-separated — e.g. `BOT_OWNER_ID=111111111111111111,222222222222222222`. The app owner is always allowed on top of these.
 
 - `/restart` re-execs the process in place — self-contained, doesn't rely on the host's restart policy.
 - `/update` runs `git pull origin main` in the bot's directory, then restarts to load the new code. Requires the bot to be running from a git clone of the repo with `origin` pointing at GitHub, and `git` installed on the host. If `requirements.txt` changed, restart again via your host so deps reinstall.

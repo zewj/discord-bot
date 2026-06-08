@@ -175,8 +175,8 @@ YTDLP_COOKIES_FROM_BROWSER = os.environ.get("YTDLP_COOKIES_FROM_BROWSER")
 # Last-resort fix for hard-blocked datacenter IPs: route yt-dlp through a proxy
 # (ideally residential). Format: http://user:pass@host:port  or  socks5://host:port
 YTDLP_PROXY = os.environ.get("YTDLP_PROXY")
-# Optional override for who may use /restart and /update. If unset, the bot's
-# application owner (auto-detected at startup) is used.
+# Extra accounts allowed to use /restart and /update, in addition to the bot's
+# application owner (auto-detected at startup). Comma- or space-separated IDs.
 BOT_OWNER_ID = os.environ.get("BOT_OWNER_ID")
 
 # ---------- Config ----------
@@ -1591,20 +1591,24 @@ async def handle_chat(message: discord.Message, content: str):
 
 # ---------- Discord events ----------
 
-OWNER_ID: int | None = int(BOT_OWNER_ID) if (BOT_OWNER_ID or "").isdigit() else None
+# Owners allowed to use /restart and /update. BOT_OWNER_ID may list several IDs
+# (comma- or space-separated) for multiple accounts; the app owner is always
+# added on top at startup.
+OWNER_IDS: set[int] = {
+    int(p) for p in re.split(r"[,\s]+", (BOT_OWNER_ID or "").strip()) if p.isdigit()
+}
 
 
 @bot.event
 async def on_ready():
-    global OWNER_ID
     load_config()
     load_memory()
-    if OWNER_ID is None:
-        try:
-            app = await bot.application_info()
-            OWNER_ID = app.owner.id
-        except Exception as e:
-            print(f"Could not determine bot owner: {e}")
+    try:
+        app = await bot.application_info()
+        if app.owner:
+            OWNER_IDS.add(app.owner.id)
+    except Exception as e:
+        print(f"Could not determine bot owner: {e}")
     try:
         synced = await tree.sync()
         synced_n = len(synced)
@@ -3580,7 +3584,7 @@ def _check_manage(interaction: discord.Interaction) -> bool:
 
 
 def _is_owner(interaction: discord.Interaction) -> bool:
-    return OWNER_ID is not None and interaction.user.id == OWNER_ID
+    return interaction.user.id in OWNER_IDS
 
 
 def _git_pull() -> tuple[bool, str]:
