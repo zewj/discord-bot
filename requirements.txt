@@ -1,4 +1,7 @@
 discord.py[voice]>=2.4.0
 anthropic>=0.40.0
 python-dotenv>=1.0.0
+# yt-dlp must stay current (YouTube breaks old versions → 403s). If your host
+# installs with `pip install -U -r requirements.txt`, this upgrades every boot.
+# bot.py also self-updates yt-dlp at startup (disable with YTDLP_AUTO_UPDATE=0).
 yt-dlp>=2024.10.7

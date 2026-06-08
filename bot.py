@@ -87,6 +87,8 @@ import os
 import random
 import re
 import shutil
+import subprocess
+import sys
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -97,6 +99,46 @@ import discord
 from discord import app_commands
 import anthropic
 from anthropic import AsyncAnthropic
+
+
+def _auto_update_ytdlp() -> None:
+    """Upgrade yt-dlp to the latest release at startup, before it's imported.
+
+    YouTube breaks yt-dlp constantly; a stale copy is the #1 cause of 403s and
+    failed extractions. Runs `pip install -U yt-dlp` once per boot. Best-effort:
+    network/pip failures are non-fatal (we just use whatever's installed).
+
+    Disable with YTDLP_AUTO_UPDATE=0. On Pterodactyl-style hosts that install to
+    `--prefix .local`, that layout is auto-detected so the upgrade lands on the
+    same import path; override with YTDLP_UPDATE_PREFIX if needed.
+    """
+    if os.environ.get("YTDLP_AUTO_UPDATE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    cmd = [sys.executable, "-m", "pip", "install", "-U", "yt-dlp", "--disable-pip-version-check"]
+    prefix = os.environ.get("YTDLP_UPDATE_PREFIX")
+    if not prefix:
+        local = Path(__file__).resolve().parent / ".local"
+        if local.exists():
+            prefix = str(local)
+    if prefix:
+        cmd += ["--prefix", prefix]
+    try:
+        result = subprocess.run(cmd, timeout=120, capture_output=True, text=True)
+        if result.returncode == 0:
+            line = next(
+                (ln for ln in result.stdout.splitlines()
+                 if "yt-dlp" in ln and ("Successfully installed" in ln or "already" in ln)),
+                "updated",
+            )
+            print(f"[startup] yt-dlp auto-update: {line.strip()}")
+        else:
+            print(f"[startup] yt-dlp auto-update skipped (pip rc={result.returncode}): "
+                  f"{result.stderr.strip()[:200]}")
+    except Exception as e:
+        print(f"[startup] yt-dlp auto-update skipped: {type(e).__name__}: {e}")
+
+
+_auto_update_ytdlp()
 
 try:
     import yt_dlp  # type: ignore
