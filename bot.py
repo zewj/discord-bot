@@ -4064,6 +4064,15 @@ async def play_cmd(
                     "Spotify playlists need `SPOTIFY_CLIENT_ID` and "
                     "`SPOTIFY_CLIENT_SECRET` set on the host."
                 )
+            elif _is_spotify_url(query):
+                hint = (
+                    "Spotify **editorial / algorithmic** playlists (made by Spotify — "
+                    "'This Is…', Daily Mix, Discover Weekly, mood/genre mixes) can't be "
+                    "read by apps anymore (Spotify cut off API access in late 2024). "
+                    "**User-made** public playlists still work — check the playlist's "
+                    "creator. (If this *is* a user playlist, check the host logs for the "
+                    "`[spotify] playlist lookup HTTP` code.)"
+                )
             elif "music.apple.com" in query.lower() and "/playlist/" in query.lower():
                 hint = (
                     "Apple Music **curated playlists** aren't supported (they're not "
