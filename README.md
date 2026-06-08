@@ -100,6 +100,7 @@ python bot.py
   - **Autoplay (radio)**: on by default — when the queue runs dry, the bot finds a related track (seeded off YouTube's Mix for the last song) and keeps playing, drifting naturally and avoiding recent repeats. `/autoplay state:off` to make it stop at the end of the queue instead; `/autoplay` shows the current setting. `/stop` and `/leave` always end it
   - **Auto-pause**: if everyone leaves and the bot is alone, playback pauses automatically; it resumes when someone rejoins (a manual `/pause` is left untouched)
   - **24/7 mode** (on by default): the bot stays in the voice channel even when nothing's playing or the channel is empty — it never auto-leaves. Turn it off with `/247 state:off` to restore the old behaviour (disconnect after 5 minutes idle/empty). `/leave` always disconnects regardless
+  - **`/seek`** jumps to any spot in the current track; **`/eq`** applies effect presets (bass boost, nightcore, vaporwave, night mode…) live; **`/lyrics`** pulls lyrics from lrclib (free, no key); **`/removeuser`** clears everything a given user queued
 
 ## Slash commands
 
@@ -124,8 +125,12 @@ python bot.py
 | `/shuffle`| Shuffle the queue                                               |
 | `/volume` | Set playback volume 0-200% (default 100)                        |
 | `/remove` | Remove a track from the queue by position                       |
+| `/removeuser` | Remove every queued track a specific user added             |
 | `/clear`  | Clear the queue but keep the current track playing              |
 | `/jump`   | Skip ahead to a specific queue position                         |
+| `/seek`   | Jump to a position in the current track (`mm:ss` or seconds)     |
+| `/eq`     | Apply an equalizer/effect preset (bass boost, nightcore, vaporwave, etc.) |
+| `/lyrics` | Show lyrics for the current track (or a search query) via lrclib |
 | `/dj`     | Set the DJ role (only it can control playback), or show the current one (Manage Channels to set) |
 | `/djoff`  | Clear the DJ role so everyone can control playback again (Manage Channels) |
 | `/autoplay` | Toggle autoplay (keep playing related songs when the queue ends); default on |

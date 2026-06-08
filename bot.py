@@ -1744,6 +1744,18 @@ FFMPEG_BEFORE_OPTS = (
 )
 FFMPEG_OPTS = "-vn -loglevel warning"
 
+# Equalizer / effect presets → ffmpeg -af filter chains (48 kHz = Discord's rate).
+EQ_PRESETS: dict[str, str] = {
+    "flat":      "",                                      # no filter (default)
+    "bassboost": "bass=g=12",
+    "bass++":    "bass=g=20",
+    "treble":    "treble=g=10",
+    "nightcore": "asetrate=48000*1.25,aresample=48000",   # faster + higher pitch
+    "vaporwave": "asetrate=48000*0.82,aresample=48000",   # slowed + deeper
+    "soft":      "loudnorm",                              # even out loudness (night mode)
+    "earrape":   "acrusher=level_in=4:level_out=8:bits=8:mode=log",
+}
+
 # A track that dies in under this many seconds (with a much longer duration) is
 # treated as a failed stream and re-resolved once. Covers 403s / expired URLs.
 MUSIC_EARLY_DEATH_SECONDS = 8
@@ -1821,6 +1833,7 @@ class GuildMusic:
         # Playback modes
         self.loop_mode: str = "off"        # "off" | "track" | "queue"
         self.volume: float = 1.0           # PCMVolumeTransformer multiplier, 0.0-2.0
+        self.eq: str = "flat"              # current EQ/effect preset (see EQ_PRESETS)
         # Set by skip()/jump() so the next _advance bypasses loop_mode for that
         # single transition (user explicitly wants to move forward, not loop).
         self._force_advance: bool = False
@@ -2179,7 +2192,7 @@ class GuildMusic:
                 next_track.stream_url,
                 executable=FFMPEG_PATH or "ffmpeg",
                 before_options=_ffmpeg_before_options(next_track),
-                options=FFMPEG_OPTS,
+                options=self._ffmpeg_options(),
             )
             source = discord.PCMVolumeTransformer(source, volume=self.volume)
             self.voice.play(source, after=self._after_play)
@@ -2405,6 +2418,68 @@ class GuildMusic:
         if self.voice and isinstance(self.voice.source, discord.PCMVolumeTransformer):
             self.voice.source.volume = self.volume
         return level_pct
+
+    # ---- ffmpeg source rebuild (seek / EQ) ----
+
+    def _ffmpeg_options(self) -> str:
+        """ffmpeg output options for the current EQ preset."""
+        af = EQ_PRESETS.get(self.eq, "")
+        return f"{FFMPEG_OPTS} -af {af}" if af else FFMPEG_OPTS
+
+    def _rebuild_source(self, position: float) -> bool:
+        """Re-create the audio source for the current track starting at
+        `position` seconds, applying the current EQ, and hot-swap it into the
+        running player (no stop/replay flicker). Used by /seek and /eq."""
+        if not self.current or not self.current.stream_url or self.voice is None:
+            return False
+        if not (self.voice.is_playing() or self.voice.is_paused()):
+            return False
+        position = max(0.0, float(position))
+        try:
+            before = f"-ss {position:.2f} {_ffmpeg_before_options(self.current)}"
+            src = discord.FFmpegPCMAudio(
+                self.current.stream_url,
+                executable=FFMPEG_PATH or "ffmpeg",
+                before_options=before,
+                options=self._ffmpeg_options(),
+            )
+            src = discord.PCMVolumeTransformer(src, volume=self.volume)
+            was_paused = self.voice.is_paused()
+            self.voice.source = src  # discord.py swaps it in the live player
+        except Exception as e:
+            print(f"[music guild={self.guild_id}] source rebuild failed: {e}")
+            return False
+        # Re-anchor the playback timer to the new position.
+        self._accumulated = position
+        self._started_at = None if was_paused else time.time()
+        return True
+
+    def seek(self, position: float) -> bool:
+        """Jump to `position` seconds in the current track."""
+        if not self.current:
+            return False
+        dur = self.current.duration
+        if dur and position >= dur:
+            return False
+        return self._rebuild_source(position)
+
+    def set_eq(self, preset: str) -> bool:
+        """Switch the EQ/effect preset, applying it live to the current track."""
+        if preset not in EQ_PRESETS:
+            return False
+        self.eq = preset
+        # Re-anchor at the current spot so the effect takes hold immediately.
+        if self.is_active() and self.current:
+            self._rebuild_source(self.elapsed())
+        return True
+
+    async def remove_by_user(self, user_id: int) -> int:
+        """Drop every queued track requested by `user_id`. Returns how many."""
+        async with self._lock:
+            kept = [t for t in self.queue if t.requester_id != user_id]
+            removed = len(self.queue) - len(kept)
+            self.queue = deque(kept)
+        return removed
 
     async def shuffle(self) -> int:
         """Randomize queue order. Returns count of tracks shuffled."""
@@ -3004,6 +3079,53 @@ async def fetch_autoplay_track(
             source_label="Autoplay",
             resolve_query=watch_url,
         )
+    return None
+
+
+# ---- Lyrics (lrclib — free, no key) ----
+
+_TITLE_NOISE_RE = re.compile(
+    r"""\s*(?:
+        \([^)]*(?:official|lyric|audio|video|visualizer|hd|hq|mv|m/v|remaster|explicit)[^)]*\)
+      | \[[^\]]*(?:official|lyric|audio|video|visualizer|hd|hq|mv|remaster|explicit)[^\]]*\]
+      | (?:official\s*(?:music\s*)?video|lyric video|audio|visualizer|hd|hq)
+    )\s*""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _clean_title(title: str) -> str:
+    """Strip YouTube-ish noise ('(Official Video)', '[Lyrics]', etc.) so lyric
+    lookups match better."""
+    cleaned = _TITLE_NOISE_RE.sub(" ", title)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -–—|")
+    return cleaned or title
+
+
+async def fetch_lyrics(query: str) -> tuple[str, str, str] | None:
+    """Look up lyrics on lrclib. Returns (track, artist, plain_lyrics) or None."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://lrclib.net/api/search", params={"q": query}
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[lyrics] search HTTP {resp.status} for {query!r}")
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        print(f"[lyrics] search failed for {query!r}: {e}")
+        return None
+
+    for hit in (data or []):
+        plain = (hit.get("plainLyrics") or "").strip()
+        if plain:
+            return (
+                hit.get("trackName") or query,
+                hit.get("artistName") or "",
+                plain,
+            )
     return None
 
 
@@ -3973,6 +4095,143 @@ async def remove_cmd(interaction: discord.Interaction, position: int):
         )
         return
     await interaction.response.send_message(f"🗑 Removed **{removed.title}** from the queue.")
+
+
+@tree.command(name="removeuser", description="Remove every queued track a specific user added.")
+@app_commands.describe(user="Whose queued tracks to remove")
+async def removeuser_cmd(interaction: discord.Interaction, user: discord.Member):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    if not await _require_dj(interaction):
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or not music.queue:
+        await interaction.response.send_message("Queue is empty.", ephemeral=True)
+        return
+    removed = await music.remove_by_user(user.id)
+    if removed == 0:
+        await interaction.response.send_message(
+            f"**{user.display_name}** has nothing in the queue.", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        f"🗑 Removed **{removed}** track{'s' if removed != 1 else ''} added by **{user.display_name}**."
+    )
+
+
+@tree.command(name="seek", description="Jump to a position in the current track (mm:ss or seconds).")
+@app_commands.describe(position="Where to jump to, e.g. 1:30 or 90")
+async def seek_cmd(interaction: discord.Interaction, position: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    if not await _require_dj(interaction):
+        return
+    music = guild_music.get(interaction.guild.id)
+    if not music or music.current is None or not music.is_active():
+        await interaction.response.send_message("Nothing playing.", ephemeral=True)
+        return
+    # Parse mm:ss / hh:mm:ss / raw seconds.
+    raw = position.strip()
+    try:
+        if ":" in raw:
+            parts = [int(p) for p in raw.split(":")]
+            secs = 0
+            for p in parts:
+                secs = secs * 60 + p
+        else:
+            secs = int(float(raw))
+    except ValueError:
+        await interaction.response.send_message(
+            "Couldn't parse that — use `1:30`, `0:45`, or a number of seconds.",
+            ephemeral=True,
+        )
+        return
+    if secs < 0:
+        secs = 0
+    dur = music.current.duration
+    if dur and secs >= dur:
+        await interaction.response.send_message(
+            f"That's past the end ({_format_time(dur)}). Pick an earlier spot.",
+            ephemeral=True,
+        )
+        return
+    if music.seek(secs):
+        await interaction.response.send_message(f"⏩ Seeked to **{_format_time(secs)}**.")
+    else:
+        await interaction.response.send_message("Couldn't seek that track.", ephemeral=True)
+
+
+@tree.command(name="eq", description="Apply an equalizer / effect preset to playback.")
+@app_commands.describe(preset="Which sound preset to use")
+@app_commands.choices(preset=[
+    app_commands.Choice(name="flat (off)", value="flat"),
+    app_commands.Choice(name="bass boost", value="bassboost"),
+    app_commands.Choice(name="bass boost ++", value="bass++"),
+    app_commands.Choice(name="treble", value="treble"),
+    app_commands.Choice(name="nightcore", value="nightcore"),
+    app_commands.Choice(name="vaporwave / slowed", value="vaporwave"),
+    app_commands.Choice(name="soft (night mode)", value="soft"),
+    app_commands.Choice(name="earrape (you asked for it)", value="earrape"),
+])
+async def eq_cmd(interaction: discord.Interaction, preset: app_commands.Choice[str]):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    if not await _require_dj(interaction):
+        return
+    music = get_or_create_music(interaction.guild.id)
+    if not music.set_eq(preset.value):
+        await interaction.response.send_message("Unknown preset.", ephemeral=True)
+        return
+    label = "off" if preset.value == "flat" else f"**{preset.name}**"
+    note = "" if not music.is_active() else " (applied to the current track)"
+    await interaction.response.send_message(f"🎛 EQ set to {label}{note}.")
+
+
+@tree.command(name="lyrics", description="Show lyrics for the current track (or a search query).")
+@app_commands.describe(query="Song to look up (defaults to what's playing)")
+async def lyrics_cmd(interaction: discord.Interaction, query: str | None = None):
+    if query:
+        search = query.strip()
+        title_hint = search
+    else:
+        music = guild_music.get(interaction.guild.id) if interaction.guild else None
+        if not music or music.current is None:
+            await interaction.response.send_message(
+                "Nothing playing — give me a song to look up: `/lyrics query: artist - title`.",
+                ephemeral=True,
+            )
+            return
+        title_hint = _clean_title(music.current.title)
+        # Include the uploader as an artist hint if the title lacks a dash.
+        search = title_hint
+        if "-" not in title_hint and music.current.uploader:
+            search = f"{music.current.uploader} {title_hint}"
+
+    await interaction.response.defer()
+    result = await fetch_lyrics(search)
+    if result is None:
+        await interaction.followup.send(
+            f"Couldn't find lyrics for **{title_hint}**. Try `/lyrics query: artist - title`.",
+            ephemeral=True,
+        )
+        return
+    track, artist, lyrics = result
+    header = f"🎤 {track}" + (f" — {artist}" if artist else "")
+    # Discord embed description cap is 4096; chunk on blank lines to be safe.
+    chunks = smart_chunk(lyrics, 3900)
+    first = discord.Embed(
+        title=header[:256], description=chunks[0], color=MUSIC_EMBED_COLOR
+    )
+    if len(chunks) > 1:
+        first.set_footer(text=f"part 1/{len(chunks)}")
+    await interaction.followup.send(embed=first)
+    for i, chunk in enumerate(chunks[1:], 2):
+        em = discord.Embed(description=chunk, color=MUSIC_EMBED_COLOR)
+        em.set_footer(text=f"part {i}/{len(chunks)}")
+        await interaction.followup.send(embed=em)
 
 
 @tree.command(name="clear", description="Clear the queue without stopping the current track.")
