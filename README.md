@@ -121,6 +121,7 @@ python bot.py
 | `/mood`   | Switch personality preset (`escalating` / `feral` / `villain` / `chill` / `tsundere`) — scope `server` or `here` |
 | `/rage`   | Show the current patience meter for this conversation (with bar + tier) |
 | `/status` | Show model, mood, memory, scope, active conversation count      |
+| `/specs`  | Host hardware (CPU, container RAM, disk) + bot runtime stats (uptime, ping, servers) |
 | `/play`   | Join voice and queue a track **or playlist/album** from YouTube/SoundCloud/Spotify/Apple Music (URL or search) |
 | `/pause`  | Pause the current track                                         |
 | `/resume` | Resume a paused track                                           |

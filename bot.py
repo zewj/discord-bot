@@ -801,6 +801,7 @@ guild_autoplay: dict[int, bool] = {}      # guild_id -> autoplay on/off (default
 guild_247: dict[int, bool] = {}           # guild_id -> stay in VC 24/7 (default on)
 
 cleanup_runs = 0
+START_TIME = time.time()   # for /specs uptime
 
 
 # ---------- Persistence ----------
@@ -3650,6 +3651,90 @@ def _restart_process() -> None:
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
+# ---------- /specs system info (stdlib only, container-aware) ----------
+
+def _read_int_file(path: str) -> int | None:
+    try:
+        with open(path) as f:
+            v = f.read().strip()
+        return int(v) if v.lstrip("-").isdigit() else None
+    except Exception:
+        return None
+
+
+def _container_memory() -> tuple[int | None, int | None]:
+    """(used, limit) bytes for the container via cgroups (v2 then v1). Limit is
+    None when unlimited. Falls back to host /proc/meminfo."""
+    used = _read_int_file("/sys/fs/cgroup/memory.current")
+    if used is not None:
+        raw = None
+        try:
+            with open("/sys/fs/cgroup/memory.max") as f:
+                t = f.read().strip()
+            raw = None if t == "max" else int(t)
+        except Exception:
+            pass
+        return used, raw
+    used = _read_int_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    if used is not None:
+        limit = _read_int_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        if limit and limit > (1 << 62):
+            limit = None  # v1 "unlimited" is a huge sentinel
+        return used, limit
+    # Host fallback
+    total = avail = None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    total = int(line.split()[1]) * 1024
+                elif line.startswith("MemAvailable:"):
+                    avail = int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    if total is not None and avail is not None:
+        return total - avail, total
+    return None, None
+
+
+def _proc_rss() -> int | None:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_bytes(n: int | None) -> str:
+    if n is None:
+        return "?"
+    x = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if x < 1024 or unit == "TB":
+            return f"{x:.0f} {unit}" if unit == "B" else f"{x:.1f} {unit}"
+        x /= 1024
+    return f"{x:.1f} TB"
+
+
+def _fmt_uptime(secs: float) -> str:
+    secs = int(secs)
+    d, secs = divmod(secs, 86400)
+    h, secs = divmod(secs, 3600)
+    m, s = divmod(secs, 60)
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)
+
+
 SCOPE_CHOICES = [
     app_commands.Choice(name="this channel/thread only", value="here"),
     app_commands.Choice(name="whole server (default)",   value="server"),
@@ -3957,6 +4042,73 @@ async def status_cmd(interaction: discord.Interaction):
             f"• DJ role: {dj_label}"
         )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@tree.command(name="specs", description="Show host hardware + bot runtime stats.")
+async def specs_cmd(interaction: discord.Interaction):
+    import platform
+    embed = discord.Embed(title="🖥 Specs", color=MUSIC_EMBED_COLOR)
+
+    # --- System ---
+    cores = os.cpu_count() or 0
+    try:
+        load = ", ".join(f"{x:.2f}" for x in os.getloadavg())
+    except (OSError, AttributeError):
+        load = "n/a"
+    sys_lines = [
+        f"**OS:** {platform.system()} {platform.release()}",
+        f"**CPU:** {cores} core{'s' if cores != 1 else ''} • load (1/5/15m): {load}",
+    ]
+    try:
+        import psutil  # optional — nicer live CPU% if present
+        sys_lines.append(f"**CPU usage:** {psutil.cpu_percent(interval=0.3):.0f}%")
+    except Exception:
+        pass
+    embed.add_field(name="System", value="\n".join(sys_lines), inline=False)
+
+    # --- Memory (container-aware) ---
+    used, limit = _container_memory()
+    if used is not None and limit:
+        pct = used / limit * 100
+        mem_str = f"{_fmt_bytes(used)} / {_fmt_bytes(limit)} ({pct:.0f}%)"
+    elif used is not None:
+        mem_str = f"{_fmt_bytes(used)} used (no limit detected)"
+    else:
+        mem_str = "n/a"
+    rss = _proc_rss()
+    embed.add_field(
+        name="Memory",
+        value=f"**Container:** {mem_str}\n**This bot:** {_fmt_bytes(rss)}",
+        inline=True,
+    )
+
+    # --- Disk ---
+    try:
+        du = shutil.disk_usage(str(Path(__file__).resolve().parent))
+        disk_str = (
+            f"{_fmt_bytes(du.used)} / {_fmt_bytes(du.total)} "
+            f"({du.used / du.total * 100:.0f}%)"
+        )
+    except Exception:
+        disk_str = "n/a"
+    embed.add_field(name="Disk", value=disk_str, inline=True)
+
+    # --- Runtime ---
+    ping = round(bot.latency * 1000) if bot.latency == bot.latency else 0  # NaN guard
+    runtime = [
+        f"**Uptime:** {_fmt_uptime(time.time() - START_TIME)}",
+        f"**Ping:** {ping} ms",
+        f"**Servers:** {len(bot.guilds)} • **Users (cached):** {len(bot.users)}",
+        f"**Active convos:** {len(history)} • **Voice connections:** {len(guild_music)}",
+    ]
+    embed.add_field(name="Bot", value="\n".join(runtime), inline=False)
+
+    # --- Versions ---
+    embed.set_footer(
+        text=f"Python {platform.python_version()} • discord.py {discord.__version__} "
+             f"• model {MODEL}"
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="restart", description="Restart the bot (owner only).")
