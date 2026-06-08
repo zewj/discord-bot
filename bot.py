@@ -1642,42 +1642,63 @@ async def on_ready():
     print("=" * 60)
 
 
-@bot.event
-async def on_message(message: discord.Message):
+def _engages_bot(message: discord.Message) -> bool:
+    """Whether the bot should respond to this message: DM, @mention, an
+    auto-reply channel, or a reply to one of the bot's own messages."""
     if message.author.bot:
-        return
+        return False
+    if message.guild is None:
+        return True
+    if bot.user in message.mentions:
+        return True
+    if message.channel.id in auto_channels.get(message.guild.id, set()):
+        return True
+    ref = message.reference
+    if ref and ref.resolved and not isinstance(ref.resolved, discord.DeletedReferencedMessage):
+        return ref.resolved.author.id == bot.user.id
+    return False
 
-    is_dm = message.guild is None
-    mentioned = bot.user in message.mentions
-    is_auto_channel = (
-        message.guild is not None
-        and message.channel.id in auto_channels.get(message.guild.id, set())
-    )
 
-    is_reply_to_bot = False
-    if message.reference and message.reference.resolved and not isinstance(
-        message.reference.resolved, discord.DeletedReferencedMessage
-    ):
-        is_reply_to_bot = message.reference.resolved.author.id == bot.user.id
-
-    if not (is_dm or mentioned or is_auto_channel or is_reply_to_bot):
-        return
-
+def _message_payload(message: discord.Message) -> tuple[str, bool]:
+    """Return (content with the bot mention stripped, has_renderable_content)."""
     content = message.content
-    if mentioned:
+    if bot.user in message.mentions:
         content = content.replace(f"<@{bot.user.id}>", "").replace(
             f"<@!{bot.user.id}>", ""
         ).strip()
-
     has_images = any(
         att.content_type and att.content_type.startswith("image/")
         for att in message.attachments
     )
     has_stickers = bool(message.stickers)
-    if not content and not has_images and not has_stickers:
-        return
+    return content, bool(content or has_images or has_stickers)
 
+
+@bot.event
+async def on_message(message: discord.Message):
+    if not _engages_bot(message):
+        return
+    content, has_payload = _message_payload(message)
+    if not has_payload:
+        return
     await handle_chat(message, content)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    """If an edit NEWLY makes the bot engage — e.g. someone fixes a message to
+    add the @mention — treat it like a fresh message. Skips edits that already
+    triggered (handled by on_message), so we don't double-respond."""
+    if after.author.bot:
+        return
+    if before.content == after.content:
+        return
+    if not _engages_bot(after) or _engages_bot(before):
+        return
+    content, has_payload = _message_payload(after)
+    if not has_payload:
+        return
+    await handle_chat(after, content)
 
 
 @bot.event
@@ -3822,17 +3843,51 @@ async def status_cmd(interaction: discord.Interaction):
             f"{len(sticker_map)} stickers "
             f"(of {len(interaction.guild.stickers)} total)"
         )
+        # Music state (per-guild)
+        gid = interaction.guild.id
+        autoplay_on = guild_autoplay.get(gid, True)
+        stay_on = guild_247.get(gid, True)
+        mus = guild_music.get(gid)
+        if mus and mus.voice and mus.voice.is_connected():
+            now = mus.current.title if mus.current else "nothing"
+            playing = f"in <#{mus.voice.channel.id}>, playing **{now}** ({len(mus.queue)} queued)"
+        else:
+            playing = "not connected"
+        eq_label = mus.eq if mus else "flat"
+        dj = dj_roles.get(gid)
+        dj_label = f"<@&{dj}>" if dj else "off (open to all)"
+        lines.append(
+            f"**Music:** {playing}\n"
+            f"• EQ: `{eq_label}` • volume: `{int(round((mus.volume if mus else 1.0) * 100))}%` "
+            f"• loop: `{mus.loop_mode if mus else 'off'}`\n"
+            f"• autoplay: `{'on' if autoplay_on else 'off'}` "
+            f"• 24/7: `{'on' if stay_on else 'off'}` "
+            f"• DJ role: {dj_label}"
+        )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-@tree.command(name="play", description="Play a track or playlist (URL or search query).")
-@app_commands.describe(query="A URL (track or playlist) or search terms")
-async def play_cmd(interaction: discord.Interaction, query: str):
+@tree.command(name="play", description="Play a track/playlist (URL or search) or an uploaded audio file.")
+@app_commands.describe(
+    query="A URL (track or playlist) or search terms",
+    file="An audio file to play directly (mp3, flac, wav, m4a, ogg, opus…)",
+)
+async def play_cmd(
+    interaction: discord.Interaction,
+    query: str | None = None,
+    file: discord.Attachment | None = None,
+):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
     if not MUSIC_AVAILABLE:
         await interaction.response.send_message(_music_unavailable_msg(), ephemeral=True)
+        return
+    if not query and file is None:
+        await interaction.response.send_message(
+            "Give me something to play — a search, a URL, or an uploaded audio file.",
+            ephemeral=True,
+        )
         return
 
     channel = _user_voice_channel(interaction)
@@ -3876,8 +3931,29 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         )
         return
 
+    # ---- Direct audio attachment ----
+    if file is not None:
+        ctype = (file.content_type or "").lower()
+        is_audio = ctype.startswith("audio/") or file.filename.lower().endswith(
+            (".mp3", ".flac", ".wav", ".ogg", ".oga", ".m4a", ".opus", ".aac", ".weba")
+        )
+        if not is_audio:
+            await interaction.followup.send(
+                f"`{file.filename}` doesn't look like an audio file I can play.",
+                ephemeral=True,
+            )
+            return
+        track = Track(
+            stream_url=file.url,
+            webpage_url=file.url,
+            title=file.filename.rsplit(".", 1)[0],
+            duration=None,
+            requester_id=interaction.user.id,
+            requester_name=interaction.user.display_name,
+            source_label="File",
+        )
     # ---- Playlist / album branch ----
-    if _is_playlist_url(query):
+    elif _is_playlist_url(query):
         result = await resolve_playlist(
             query, interaction.user.id, interaction.user.display_name
         )
@@ -3911,30 +3987,30 @@ async def play_cmd(interaction: discord.Interaction, query: str):
             embed.set_footer(text=f"Capped at {MUSIC_MAX_QUEUE}-track queue limit")
         await interaction.followup.send(embed=embed)
         return
-
-    track = await resolve_track(query, interaction.user.id, interaction.user.display_name)
-    if track is None:
-        # Tailor the error to the input — Spotify needs creds, Apple Music
-        # only handles single-track URLs, etc.
-        if _is_spotify_url(query) and not SPOTIFY_AVAILABLE:
-            hint = (
-                "Spotify URLs need `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` "
-                "set on the host. Tell whoever runs me, or send a YouTube link instead."
+    # ---- Single track (URL or search) ----
+    else:
+        track = await resolve_track(query, interaction.user.id, interaction.user.display_name)
+        if track is None:
+            # Tailor the error to the input.
+            if _is_spotify_url(query) and not SPOTIFY_AVAILABLE:
+                hint = (
+                    "Spotify URLs need `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` "
+                    "set on the host. Tell whoever runs me, or send a YouTube link instead."
+                )
+            elif _is_spotify_url(query):
+                hint = "Couldn't resolve that Spotify track. Try a YouTube link or search instead."
+            elif _is_apple_music_url(query):
+                hint = (
+                    "Couldn't resolve that Apple Music link. Single-track URLs only "
+                    "(the kind with `?i=...` at the end). Albums aren't supported yet."
+                )
+            else:
+                hint = "Try a YouTube/SoundCloud URL or different search terms."
+            await interaction.followup.send(
+                f"Couldn't play `{query[:200]}`.\n{hint}",
+                ephemeral=True,
             )
-        elif _is_spotify_url(query):
-            hint = "Couldn't resolve that Spotify track. Try a YouTube link or search instead."
-        elif _is_apple_music_url(query):
-            hint = (
-                "Couldn't resolve that Apple Music link. Single-track URLs only "
-                "(the kind with `?i=...` at the end). Albums aren't supported yet."
-            )
-        else:
-            hint = "Try a YouTube/SoundCloud URL or different search terms."
-        await interaction.followup.send(
-            f"Couldn't play `{query[:200]}`.\n{hint}",
-            ephemeral=True,
-        )
-        return
+            return
 
     started_immediately = (music.current is None) and not music.is_active()
     position = await music.enqueue(track)

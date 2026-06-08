@@ -97,6 +97,7 @@ python bot.py
 - **Server stickers (in & out)**: the bot can read user-sent stickers (notes them in conversation context) and post stickers itself via the `send_sticker` tool. Up to 25 stickers per server are exposed; max 3 per outgoing message (Discord's hard limit)
 - **Music playback**: if `ffmpeg` is installed on the host, the bot joins your voice channel and streams audio. Join a voice channel, then run `/play <URL or search>`. Sources:
   - **YouTube** — URL or plain search text (default)
+  - **Uploaded audio files** — attach an mp3/flac/wav/m4a/ogg/opus to `/play` (the `file:` option) to play it directly, no link needed
   - **SoundCloud** — paste a track URL (handled natively by `yt-dlp`)
   - **Spotify** — paste a track URL/URI (`open.spotify.com/track/…` or `spotify:track:…`); requires `SPOTIFY_CLIENT_ID` + `SPOTIFY_CLIENT_SECRET`. Spotify doesn't stream audio via its API, so the bot reads track metadata and plays the equivalent from YouTube
   - **Apple Music** — paste a single-track URL (`music.apple.com/…?i=…`); no credentials needed (uses iTunes Search API)
