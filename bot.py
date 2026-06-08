@@ -87,6 +87,8 @@ import os
 import random
 import re
 import shutil
+import subprocess
+import sys
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -97,6 +99,46 @@ import discord
 from discord import app_commands
 import anthropic
 from anthropic import AsyncAnthropic
+
+
+def _auto_update_ytdlp() -> None:
+    """Upgrade yt-dlp to the latest release at startup, before it's imported.
+
+    YouTube breaks yt-dlp constantly; a stale copy is the #1 cause of 403s and
+    failed extractions. Runs `pip install -U yt-dlp` once per boot. Best-effort:
+    network/pip failures are non-fatal (we just use whatever's installed).
+
+    Disable with YTDLP_AUTO_UPDATE=0. On Pterodactyl-style hosts that install to
+    `--prefix .local`, that layout is auto-detected so the upgrade lands on the
+    same import path; override with YTDLP_UPDATE_PREFIX if needed.
+    """
+    if os.environ.get("YTDLP_AUTO_UPDATE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    cmd = [sys.executable, "-m", "pip", "install", "-U", "yt-dlp", "--disable-pip-version-check"]
+    prefix = os.environ.get("YTDLP_UPDATE_PREFIX")
+    if not prefix:
+        local = Path(__file__).resolve().parent / ".local"
+        if local.exists():
+            prefix = str(local)
+    if prefix:
+        cmd += ["--prefix", prefix]
+    try:
+        result = subprocess.run(cmd, timeout=120, capture_output=True, text=True)
+        if result.returncode == 0:
+            line = next(
+                (ln for ln in result.stdout.splitlines()
+                 if "yt-dlp" in ln and ("Successfully installed" in ln or "already" in ln)),
+                "updated",
+            )
+            print(f"[startup] yt-dlp auto-update: {line.strip()}")
+        else:
+            print(f"[startup] yt-dlp auto-update skipped (pip rc={result.returncode}): "
+                  f"{result.stderr.strip()[:200]}")
+    except Exception as e:
+        print(f"[startup] yt-dlp auto-update skipped: {type(e).__name__}: {e}")
+
+
+_auto_update_ytdlp()
 
 try:
     import yt_dlp  # type: ignore
@@ -737,6 +779,7 @@ guild_moods: dict[int, str] = {}          # guild_id -> mood
 convo_moods: dict[str, str] = {}          # conversation_key -> mood
 convo_overrides_touched: dict[str, float] = {}  # last time a convo override was used
 dj_roles: dict[int, int] = {}             # guild_id -> role_id (music control gate)
+guild_autoplay: dict[int, bool] = {}      # guild_id -> autoplay on/off (default on)
 
 cleanup_runs = 0
 
@@ -745,6 +788,7 @@ cleanup_runs = 0
 
 def load_config():
     global auto_channels, guild_moods, convo_moods, convo_overrides_touched, dj_roles
+    global guild_autoplay
     if not CONFIG_PATH.exists():
         return
     try:
@@ -763,6 +807,7 @@ def load_config():
             str(k): float(t) for k, t in data.get("convo_overrides_touched", {}).items()
         }
         dj_roles      = {int(g): int(r) for g, r in data.get("dj_roles", {}).items()}
+        guild_autoplay = {int(g): bool(v) for g, v in data.get("guild_autoplay", {}).items()}
     except Exception as e:
         print(f"Failed to load config: {e}")
 
@@ -781,6 +826,7 @@ def save_config():
             "convo_moods":   convo_moods,
             "convo_overrides_touched": convo_overrides_touched,
             "dj_roles":      {str(g): r for g, r in dj_roles.items()},
+            "guild_autoplay": {str(g): v for g, v in guild_autoplay.items()},
         }, indent=2))
     except Exception as e:
         print(f"Failed to save config: {e}")
@@ -1612,6 +1658,43 @@ async def on_message(message: discord.Message):
     await handle_chat(message, content)
 
 
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+):
+    """Prune skip/leave votes when listeners leave the bot's channel so a
+    quorum can't get stuck after someone walks out mid-vote."""
+    if member.bot:
+        return
+    if before.channel == after.channel:
+        return  # mute / deafen / camera toggle — not a join/leave
+    guild = member.guild
+    if guild is None:
+        return
+    music = guild_music.get(guild.id)
+    if music is None or music.voice is None or not music.voice.is_connected():
+        return
+    if before.channel != music.voice.channel and after.channel != music.voice.channel:
+        return  # state change in some unrelated channel
+
+    listener_ids = {m.id for m in music.voice_humans()}
+    music.skip_votes &= listener_ids
+    music.leave_votes &= listener_ids
+
+    if not listener_ids:
+        # Everyone left — pause and arm the idle-disconnect so we don't sit
+        # paused in an empty channel forever.
+        if music.auto_pause_if_empty():
+            music._schedule_idle_disconnect()
+    else:
+        # Someone's (back) in the channel — resume if we auto-paused, and cancel
+        # the empty-channel disconnect timer.
+        if music.auto_resume_if_returned():
+            music._cancel_idle_disconnect()
+
+
 # ---------- Music playback (voice + yt-dlp + ffmpeg) ----------
 
 FFMPEG_PATH = shutil.which("ffmpeg")
@@ -1635,6 +1718,12 @@ YTDL_OPTS = {
     "noplaylist": True,
     "extract_flat": False,
     "skip_download": True,
+    # NOTE: we deliberately do NOT pin extractor_args player_client. Pinning a
+    # fixed client set (e.g. tv/web_safari) makes yt-dlp abort with "This video
+    # is DRM protected" on videos that only expose DRM formats to those clients.
+    # Letting yt-dlp use its (auto-updated) default client rotation lets it fall
+    # back to a client with clean formats. 403s are handled separately by
+    # forwarding yt-dlp's http_headers to ffmpeg (see _ffmpeg_before_options).
 }
 
 # Fast, shallow extraction for playlists/sets — pulls the entry list without
@@ -1652,6 +1741,28 @@ FFMPEG_BEFORE_OPTS = (
 )
 FFMPEG_OPTS = "-vn -loglevel warning"
 
+# A track that dies in under this many seconds (with a much longer duration) is
+# treated as a failed stream and re-resolved once. Covers 403s / expired URLs.
+MUSIC_EARLY_DEATH_SECONDS = 8
+
+
+def _ffmpeg_before_options(track: "Track") -> str:
+    """Base reconnect flags + the HTTP headers yt-dlp wants for this stream.
+
+    YouTube 403s the stream URL when ffmpeg's User-Agent doesn't match the
+    client that extracted it, so we forward yt-dlp's headers to ffmpeg.
+    """
+    parts = [FFMPEG_BEFORE_OPTS]
+    headers = track.http_headers or {}
+    ua = headers.get("User-Agent") or headers.get("user-agent")
+    if ua:
+        parts.append(f'-user_agent "{ua}"')
+    extra = [f"{k}: {v}" for k, v in headers.items() if k.lower() != "user-agent"]
+    if extra:
+        blob = "".join(h + "\\r\\n" for h in extra)
+        parts.append(f'-headers "{blob}"')
+    return " ".join(parts)
+
 
 @dataclass
 class Track:
@@ -1668,6 +1779,8 @@ class Track:
     uploader: str | None = None        # e.g. "Rick Astley" — YouTube channel name
     source_label: str = "YouTube"      # for embed attribution (Spotify, Apple Music, SoundCloud)
     resolve_query: str | None = None   # lazy tracks: query/URL to resolve at play time
+    http_headers: dict | None = None   # headers yt-dlp says to send when fetching the stream
+    _retry_count: int = 0              # fresh-resolution retries used (403/early-death recovery)
 
     @property
     def is_resolved(self) -> bool:
@@ -1711,6 +1824,23 @@ class GuildMusic:
         # Live progress bar: the now-playing message + the task editing it.
         self._now_playing_msg: discord.Message | None = None
         self._progress_task: asyncio.Task | None = None
+        # Democratic control: user IDs who've voted to skip / make the bot leave.
+        # skip_votes reset on track change; both pruned to current listeners.
+        self.skip_votes: set[int] = set()
+        self.leave_votes: set[int] = set()
+        # True when playback was auto-paused because the channel emptied out, so
+        # we know to auto-resume (and not clobber a manual pause) when it refills.
+        self._auto_paused: bool = False
+        # Set right before an intentional voice.stop() (skip/restart/stop/jump)
+        # so _after_play knows the early end was deliberate, not a failed stream.
+        self._expect_stop: bool = False
+        # Autoplay (radio): seed off the last track that played, and remember
+        # recent video IDs so the radio doesn't loop the same handful of songs.
+        self._last_played: Track | None = None
+        self._recent_ids: deque[str] = deque(maxlen=80)
+        # Set by stop/leave so the resulting _advance doesn't autoplay a new
+        # track (which would undo the stop). Consumed on the next _advance.
+        self._stopping: bool = False
 
     # ---- state queries ----
 
@@ -1751,6 +1881,7 @@ class GuildMusic:
             return False
         self.voice.pause()
         self._pause_timer()
+        self._auto_paused = False  # explicit user pause overrides auto-pause state
         return True
 
     def resume(self) -> bool:
@@ -1758,7 +1889,49 @@ class GuildMusic:
             return False
         self.voice.resume()
         self._resume_timer()
+        self._auto_paused = False
         return True
+
+    # ---- listener helpers (for vote / solo control) ----
+
+    def voice_humans(self) -> list:
+        """Non-bot members currently in the bot's voice channel."""
+        if not self.voice or not self.voice.channel:
+            return []
+        return [m for m in self.voice.channel.members if not m.bot]
+
+    def is_alone_with(self, member) -> bool:
+        """True if `member` is the only human in the bot's voice channel."""
+        humans = self.voice_humans()
+        return len(humans) == 1 and humans[0].id == member.id
+
+    def auto_pause_if_empty(self) -> bool:
+        """Pause playback when no humans remain in the channel. Returns True if
+        it just auto-paused. Leaves a manually-paused track alone."""
+        if self.voice_humans():
+            return False
+        if self.is_playing():
+            self.voice.pause()
+            self._pause_timer()
+            self._auto_paused = True
+            print(f"[music guild={self.guild_id}] channel empty — auto-paused")
+            return True
+        return False
+
+    def auto_resume_if_returned(self) -> bool:
+        """Resume a track that we auto-paused, now that a human is back. Returns
+        True if it just resumed. No-op for manual pauses."""
+        if not self._auto_paused:
+            return False
+        if not self.voice_humans():
+            return False
+        self._auto_paused = False
+        if self.is_paused():
+            self.voice.resume()
+            self._resume_timer()
+            print(f"[music guild={self.guild_id}] listener returned — auto-resumed")
+            return True
+        return False
 
     # ---- voice connection ----
 
@@ -1819,9 +1992,28 @@ class GuildMusic:
         track.duration = track.duration or resolved.duration
         track.thumbnail_url = track.thumbnail_url or resolved.thumbnail_url
         track.uploader = track.uploader or resolved.uploader
+        track.http_headers = resolved.http_headers
         if not track.title or track.title == "(untitled)":
             track.title = resolved.title
         return True
+
+    async def _try_autoplay(self) -> Track | None:
+        """When the queue empties, fetch a related track to keep playing — if
+        autoplay is enabled for this guild and we have a seed to work from."""
+        if not guild_autoplay.get(self.guild_id, True):
+            return None
+        seed = self._last_played
+        if seed is None:
+            return None
+        try:
+            return await fetch_autoplay_track(
+                seed, set(self._recent_ids),
+                requester_id=bot.user.id if bot.user else 0,
+                requester_name="Autoplay",
+            )
+        except Exception as e:
+            print(f"[music guild={self.guild_id}] autoplay fetch failed: {e}")
+            return None
 
     async def _advance(self, announce: bool = True) -> None:
         bypass_loop = self._force_advance
@@ -1846,13 +2038,27 @@ class GuildMusic:
                     and self.current is not None
                 ):
                     self.queue.append(self.current)
-                if not self.queue:
-                    self.current = None
-                    self._cancel_progress_task()
-                    self._schedule_idle_disconnect()
+                queue_empty = not self.queue
+                if not queue_empty:
+                    next_track = self.queue.popleft()
+                    self.current = next_track
+                    self.skip_votes.clear()  # fresh track → fresh skip vote
+
+        # Queue ran dry. Try autoplay (a related track) before going idle —
+        # unless we got here via an explicit /stop or /leave.
+        if not is_replay and queue_empty:
+            if not self._stopping:
+                auto = await self._try_autoplay()
+                if auto is not None:
+                    async with self._lock:
+                        self.queue.append(auto)
+                    await self._advance(announce=announce)
                     return
-                next_track = self.queue.popleft()
-                self.current = next_track
+            self._stopping = False
+            self.current = None
+            self._cancel_progress_task()
+            self._schedule_idle_disconnect()
+            return
 
         if self.voice is None or not self.voice.is_connected():
             self.current = None
@@ -1876,7 +2082,7 @@ class GuildMusic:
             source = discord.FFmpegPCMAudio(
                 next_track.stream_url,
                 executable=FFMPEG_PATH or "ffmpeg",
-                before_options=FFMPEG_BEFORE_OPTS,
+                before_options=_ffmpeg_before_options(next_track),
                 options=FFMPEG_OPTS,
             )
             source = discord.PCMVolumeTransformer(source, volume=self.volume)
@@ -1889,6 +2095,11 @@ class GuildMusic:
 
         self._start_timer()
         self._cancel_idle_disconnect()
+        # Remember this as the autoplay seed + mark it recently played.
+        self._last_played = next_track
+        vid = _youtube_video_id(next_track.webpage_url)
+        if vid and vid not in self._recent_ids:
+            self._recent_ids.append(vid)
         # Suppress the auto-announce when looping the same track, otherwise the
         # channel fills up with identical embeds.
         if announce and not is_replay:
@@ -1901,10 +2112,47 @@ class GuildMusic:
         # Called from a non-async thread by discord.py's audio player.
         if error:
             print(f"[music guild={self.guild_id}] ffmpeg error: {error}")
+
+        intentional = self._expect_stop
+        self._expect_stop = False
+        played = self.elapsed()
+        track = self.current
+
+        # A stream that dies almost immediately (and wasn't a user skip/stop) is
+        # almost always a 403 / expired URL. Re-resolve fresh and retry once.
+        if (
+            not intentional
+            and track is not None
+            and track.duration and track.duration > MUSIC_EARLY_DEATH_SECONDS * 2
+            and played < MUSIC_EARLY_DEATH_SECONDS
+            and track._retry_count < 1
+        ):
+            print(f"[music guild={self.guild_id}] '{track.title}' died after "
+                  f"{played:.1f}s — re-resolving and retrying")
+            track._retry_count += 1
+            # Force a fresh resolution next time it's picked up.
+            track.stream_url = None
+            if not track.resolve_query:
+                track.resolve_query = track.webpage_url
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._requeue_front_and_advance(track), bot.loop
+                )
+            except Exception as e:
+                print(f"[music guild={self.guild_id}] retry scheduling failed: {e}")
+            return
+
         try:
             asyncio.run_coroutine_threadsafe(self._advance(), bot.loop)
         except Exception as e:
             print(f"[music guild={self.guild_id}] advance scheduling failed: {e}")
+
+    async def _requeue_front_and_advance(self, track: Track) -> None:
+        async with self._lock:
+            self.queue.appendleft(track)
+        # Bypass loop logic for this transition so we replay THIS track, fresh.
+        self._force_advance = True
+        await self._advance(announce=False)
 
     async def _announce_now_playing(self) -> None:
         if not self.current or not self.last_text_channel_id:
@@ -1981,6 +2229,7 @@ class GuildMusic:
         # User explicitly wants to move forward — bypass loop_mode for this
         # one transition so loop=track doesn't replay the same song.
         self._force_advance = True
+        self._expect_stop = True  # deliberate end → don't trigger the retry
         if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
             self.voice.stop()  # triggers _after_play -> _advance
         return skipped
@@ -1993,6 +2242,8 @@ class GuildMusic:
         track = self.current
         async with self._lock:
             self.queue.appendleft(track)
+        self._force_advance = True
+        self._expect_stop = True
         if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
             self.voice.stop()
         return track
@@ -2000,6 +2251,10 @@ class GuildMusic:
     async def stop_and_clear(self) -> None:
         self._cancel_progress_task()
         self._now_playing_msg = None
+        self.skip_votes.clear()
+        self.leave_votes.clear()
+        self._expect_stop = True
+        self._stopping = True  # don't let autoplay revive a deliberate stop
         async with self._lock:
             self.queue.clear()
             self.current = None
@@ -2011,6 +2266,10 @@ class GuildMusic:
         self._cancel_idle_disconnect()
         self._cancel_progress_task()
         self._now_playing_msg = None
+        self.skip_votes.clear()
+        self.leave_votes.clear()
+        self._expect_stop = True
+        self._stopping = True
         async with self._lock:
             self.queue.clear()
             self.current = None
@@ -2083,6 +2342,7 @@ class GuildMusic:
                 self.queue.popleft()
             target = self.queue[0]
         self._force_advance = True
+        self._expect_stop = True
         if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
             self.voice.stop()
         return target
@@ -2103,7 +2363,9 @@ class GuildMusic:
             await asyncio.sleep(MUSIC_IDLE_TIMEOUT)
         except asyncio.CancelledError:
             return
-        if not self.is_active() and not self.queue:
+        # Nothing queued/playing, OR the channel is still empty (e.g. we
+        # auto-paused when everyone left and nobody came back) → disconnect.
+        if (not self.is_active() and not self.queue) or not self.voice_humans():
             print(f"[music guild={self.guild_id}] idle {MUSIC_IDLE_TIMEOUT}s — disconnecting")
             await self.leave()
 
@@ -2335,6 +2597,7 @@ async def resolve_track(
         thumbnail_url=thumb_url,
         uploader=info.get("uploader") or info.get("channel") or info.get("creator"),
         source_label=source_label,
+        http_headers=info.get("http_headers"),
     )
 
 
@@ -2539,6 +2802,83 @@ async def resolve_playlist(
     return await _resolve_ytdlp_playlist(query, requester_id, requester_name)
 
 
+# ---- Autoplay (radio): keep playing related tracks when the queue empties ----
+
+_YT_ID_RE = re.compile(
+    r"(?:youtube\.com/watch\?(?:.*&)?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)"
+    r"([A-Za-z0-9_-]{11})"
+)
+
+
+def _youtube_video_id(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = _YT_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+async def fetch_autoplay_track(
+    seed: "Track", exclude_ids: set[str], requester_id: int, requester_name: str
+) -> "Track | None":
+    """Find a track related to `seed` to continue playback (radio).
+
+    Primary: seed YouTube's Mix (RD<video_id>) and take the first entry not
+    already played. Fallback: search the seed's uploader/title. Returns a LAZY
+    Track (resolves its stream at play time), or None.
+    """
+    if not YTDLP_AVAILABLE:
+        return None
+
+    seed_id = _youtube_video_id(seed.webpage_url)
+
+    def _flat(url_or_query: str):
+        with yt_dlp.YoutubeDL(YTDL_FLAT_OPTS) as ydl:
+            return ydl.extract_info(url_or_query, download=False)
+
+    entries: list[dict] = []
+    if seed_id:
+        mix_url = f"https://www.youtube.com/watch?v={seed_id}&list=RD{seed_id}"
+        try:
+            info = await asyncio.wait_for(
+                asyncio.to_thread(_flat, mix_url), timeout=MUSIC_SEARCH_TIMEOUT
+            )
+            entries = [e for e in (info.get("entries") or []) if e]
+        except Exception as e:
+            print(f"[autoplay] mix fetch failed: {e}")
+
+    # Fallback: search by uploader/title for something in the same vein.
+    if not entries:
+        seed_terms = (seed.uploader or seed.title or "").strip()
+        if seed_terms:
+            try:
+                info = await asyncio.wait_for(
+                    asyncio.to_thread(_flat, f"ytsearch10:{seed_terms}"),
+                    timeout=MUSIC_SEARCH_TIMEOUT,
+                )
+                entries = [e for e in (info.get("entries") or []) if e]
+            except Exception as e:
+                print(f"[autoplay] fallback search failed: {e}")
+
+    for e in entries:
+        vid = e.get("id")
+        if not vid or vid == seed_id or vid in exclude_ids:
+            continue
+        url = e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
+        return Track(
+            stream_url=None,
+            webpage_url=f"https://www.youtube.com/watch?v={vid}",
+            title=e.get("title") or "(untitled)",
+            duration=int(e["duration"]) if e.get("duration") else None,
+            requester_id=requester_id,
+            requester_name=requester_name,
+            thumbnail_url=e.get("thumbnail"),
+            uploader=e.get("uploader") or e.get("channel"),
+            source_label="Autoplay",
+            resolve_query=url,
+        )
+    return None
+
+
 def _format_time(seconds: float) -> str:
     s = max(0, int(seconds))
     m, s = divmod(s, 60)
@@ -2630,13 +2970,17 @@ class MusicControls(discord.ui.View):
                 "Music only works in servers.", ephemeral=True
             )
             return None
-        # Buttons are all control actions — gate them behind the DJ role.
-        if not member_is_dj(interaction.user, interaction.guild_id):
-            await interaction.response.send_message(
-                _dj_denied_msg(interaction.guild_id), ephemeral=True
-            )
-            return None
-        return guild_music.get(interaction.guild_id)
+        music = guild_music.get(interaction.guild_id)
+        # Non-vote buttons (⏮ ⏯ ⏹ 🔁 🔀) are gated like the slash controls:
+        # DJ-role/staff, or anyone alone in the channel with the bot.
+        if member_is_dj(interaction.user, interaction.guild_id):
+            return music
+        if music and music.is_alone_with(interaction.user):
+            return music
+        await interaction.response.send_message(
+            _dj_denied_msg(interaction.guild_id), ephemeral=True
+        )
+        return None
 
     @discord.ui.button(emoji="⏮", style=discord.ButtonStyle.secondary, row=0)
     async def rewind_button(
@@ -2671,15 +3015,22 @@ class MusicControls(discord.ui.View):
     async def skip_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        music = await self._music(interaction)
-        if music is None:
+        # Skip is vote-enabled, so bypass the plain DJ gate in _music and run
+        # the same vote logic the /skip command uses.
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Music only works in servers.", ephemeral=True
+            )
             return
-        if not music.is_active():
+        music = guild_music.get(interaction.guild_id)
+        if not music or not music.is_active():
             await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        if not await _vote_gate(interaction, music, "skip"):
             return
         skipped = await music.skip()
         title = skipped.title if skipped else "track"
-        await interaction.response.send_message(f"⏭ Skipped **{title}**.", ephemeral=True)
+        await interaction.response.send_message(f"⏭ Skipped **{title}**.")
 
     @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger, row=0)
     async def stop_button(
@@ -2763,24 +3114,88 @@ def member_is_dj(member, guild_id: int) -> bool:
     return any(r.id == role_id for r in member.roles)
 
 
+def has_dj_authority(member, guild_id: int) -> bool:
+    """Stricter than member_is_dj: True only when the member has EXPLICIT
+    authority — staff, or the configured DJ role. Returns False when no DJ role
+    is set (so the alone/vote logic governs instead of blanket-allowing). Used
+    by the vote system to decide who skips the vote entirely.
+    """
+    if not isinstance(member, discord.Member):
+        return False
+    perms = member.guild_permissions
+    if perms.manage_channels or perms.manage_guild or perms.administrator:
+        return True
+    role_id = dj_roles.get(guild_id)
+    return bool(role_id) and any(r.id == role_id for r in member.roles)
+
+
 def _dj_denied_msg(guild_id: int) -> str:
     role_id = dj_roles.get(guild_id)
     mention = f"<@&{role_id}>" if role_id else "DJ"
     return (
-        f"🎧 You need the {mention} role (or Manage Server) to control playback. "
-        f"You can still use `/play`, `/queue`, and `/nowplaying`."
+        f"🎧 You need the {mention} role (or Manage Server), or to be alone in the "
+        f"voice channel with me, to control playback. You can still use `/play`, "
+        f"`/queue`, and `/nowplaying`."
     )
 
 
 async def _require_dj(interaction: discord.Interaction) -> bool:
-    """Gate a control command. Returns True if allowed; otherwise sends an
-    ephemeral denial and returns False. Call after the guild-None check."""
+    """Gate a (non-vote) control command. Allows DJ-role/staff, OR anyone who is
+    alone in the voice channel with the bot. Otherwise sends an ephemeral denial
+    and returns False. Call after the guild-None check."""
     if interaction.guild is None:
         return True
     if member_is_dj(interaction.user, interaction.guild.id):
         return True
+    music = guild_music.get(interaction.guild.id)
+    if music and music.is_alone_with(interaction.user):
+        return True
     await interaction.response.send_message(
         _dj_denied_msg(interaction.guild.id), ephemeral=True
+    )
+    return False
+
+
+async def _vote_gate(interaction: discord.Interaction, music, action: str) -> bool:
+    """Gate for vote-enabled actions ('skip', 'leave').
+
+    Returns True when the action should run NOW (the caller then executes it and
+    sends its own response). Returns False when this function already responded —
+    either a vote was registered (public) or the user can't vote yet.
+
+    Bypasses: DJ-role/staff act instantly; a solo listener acts instantly.
+    Otherwise a strict majority of the humans in the voice channel must agree.
+    """
+    member = interaction.user
+    gid = interaction.guild_id
+
+    if has_dj_authority(member, gid):
+        return True
+
+    humans = music.voice_humans()
+    if len(humans) <= 1:
+        # Solo listener (or nobody else around) → no vote needed.
+        return True
+
+    listener_ids = {m.id for m in humans}
+    if member.id not in listener_ids:
+        await interaction.response.send_message(
+            f"Join the voice channel to vote to {action}.", ephemeral=True
+        )
+        return False
+
+    votes = music.skip_votes if action == "skip" else music.leave_votes
+    votes &= listener_ids          # drop anyone who left the channel
+    votes.add(member.id)
+    needed = len(humans) // 2 + 1  # strict majority
+
+    if len(votes) >= needed:
+        votes.clear()
+        return True
+
+    await interaction.response.send_message(
+        f"🗳️ Vote to **{action}** registered — **{len(votes)}/{needed}** needed. "
+        f"Others in the voice channel can run `/{action}` (or hit the button) to agree."
     )
     return False
 
@@ -3248,11 +3663,11 @@ async def skip_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
-    if not await _require_dj(interaction):
-        return
     music = guild_music.get(interaction.guild.id)
     if not music or not music.is_active():
         await interaction.response.send_message("Nothing playing.", ephemeral=True)
+        return
+    if not await _vote_gate(interaction, music, "skip"):
         return
     skipped = await music.skip()
     title = skipped.title if skipped else "current track"
@@ -3279,11 +3694,11 @@ async def leave_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Music only works in servers.", ephemeral=True)
         return
-    if not await _require_dj(interaction):
-        return
     music = guild_music.get(interaction.guild.id)
     if not music or music.voice is None or not music.voice.is_connected():
         await interaction.response.send_message("Not in a voice channel.", ephemeral=True)
+        return
+    if not await _vote_gate(interaction, music, "leave"):
         return
     await music.leave()
     await interaction.response.send_message("👋 Left voice.")
@@ -3524,6 +3939,43 @@ async def djoff_cmd(interaction: discord.Interaction):
     else:
         await interaction.response.send_message(
             "No DJ role was set.", ephemeral=True
+        )
+
+
+@tree.command(name="autoplay", description="Toggle autoplay — keep playing related songs when the queue ends.")
+@app_commands.describe(state="Turn autoplay on or off (omit to see the current setting)")
+@app_commands.choices(state=[
+    app_commands.Choice(name="on", value="on"),
+    app_commands.Choice(name="off", value="off"),
+])
+async def autoplay_cmd(
+    interaction: discord.Interaction, state: app_commands.Choice[str] | None = None
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Music only works in servers.", ephemeral=True)
+        return
+    current = guild_autoplay.get(interaction.guild.id, True)  # default ON
+    if state is None:
+        await interaction.response.send_message(
+            f"📻 Autoplay is currently **{'on' if current else 'off'}**. "
+            f"When the queue ends, I {'keep playing related tracks' if current else 'stop'}. "
+            f"Use `/autoplay state:on|off` to change it.",
+            ephemeral=True,
+        )
+        return
+    if not await _require_dj(interaction):
+        return
+    new_val = state.value == "on"
+    guild_autoplay[interaction.guild.id] = new_val
+    save_config()
+    if new_val:
+        await interaction.response.send_message(
+            "📻 Autoplay **on** — when the queue runs out, I'll keep the vibe going "
+            "with related tracks. `/stop` or `/autoplay state:off` to end it."
+        )
+    else:
+        await interaction.response.send_message(
+            "📻 Autoplay **off** — I'll stop once the queue is empty."
         )
 
 
