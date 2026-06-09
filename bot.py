@@ -81,8 +81,11 @@ Background:
 
 import asyncio
 import atexit
+import hashlib
 import io
 import json
+import platform
+from datetime import datetime, timezone
 import os
 import random
 import re
@@ -3693,15 +3696,127 @@ async def _require_dj(interaction: discord.Interaction) -> bool:
     return False
 
 
+def _vote_embed(action: str, current: int, needed: int, track) -> discord.Embed:
+    """Embed for a pending skip/leave vote prompt — live-edited as votes come in."""
+    label = "Skip current track" if action == "skip" else "Disconnect from voice"
+    title_emoji = "🗳️"
+    embed = discord.Embed(
+        title=f"{title_emoji} Vote to {action}",
+        description=f"**{label}** • need a strict majority\n"
+                    f"Votes: **{current} / {needed}**\n"
+                    f"Tap **Vote** below to agree.",
+        color=0xFEE75C,
+    )
+    if track is not None and getattr(track, "title", None):
+        embed.add_field(name="Current track", value=f"[{track.title}]({track.webpage_url})", inline=False)
+    embed.set_footer(text="DJs and Manage-Server users can skip the vote.")
+    return embed
+
+
+class VoteView(discord.ui.View):
+    """Button view attached to /skip and /leave vote prompts so listeners can
+    add their vote with a click instead of re-running the slash command."""
+
+    def __init__(self, action: str):
+        super().__init__(timeout=300)   # 5-min window — votes auto-expire
+        self.action = action
+        self.message: discord.Message | None = None
+
+    async def on_timeout(self) -> None:
+        # Grey out the button when the prompt expires.
+        if self.message is None:
+            return
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(emoji="🗳️", label="Vote", style=discord.ButtonStyle.primary)
+    async def vote_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Servers only.", ephemeral=True)
+            return
+        music = guild_music.get(interaction.guild_id)
+        if music is None or not music.is_active():
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        member = interaction.user
+        humans = music.voice_humans()
+        listener_ids = {m.id for m in humans}
+
+        # DJ / staff / solo override = act immediately
+        if has_dj_authority(member, interaction.guild_id) or len(humans) <= 1:
+            await self._execute(interaction, music)
+            return
+
+        if member.id not in listener_ids:
+            await interaction.response.send_message(
+                f"Join the voice channel to vote to {self.action}.", ephemeral=True
+            )
+            return
+
+        votes = music.skip_votes if self.action == "skip" else music.leave_votes
+        votes &= listener_ids
+        if member.id in votes:
+            await interaction.response.send_message(
+                "You've already voted.", ephemeral=True
+            )
+            return
+        votes.add(member.id)
+        needed = len(humans) // 2 + 1
+        if len(votes) >= needed:
+            votes.clear()
+            await self._execute(interaction, music)
+            return
+
+        # Update the prompt in place so we don't spam the channel.
+        try:
+            await interaction.response.edit_message(
+                embed=_vote_embed(self.action, len(votes), needed, music.current),
+                view=self,
+            )
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                f"Vote registered ({len(votes)}/{needed}).", ephemeral=True
+            )
+
+    async def _execute(self, interaction: discord.Interaction, music) -> None:
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        title = music.current.title if music.current else "track"
+        if self.action == "skip":
+            await music.skip()
+            done = discord.Embed(
+                title="⏭ Skipped", description=f"**{title}**", color=0x57F287,
+            )
+        else:
+            await music.leave()
+            done = discord.Embed(
+                title="👋 Left voice", color=0x57F287,
+            )
+        try:
+            await interaction.response.edit_message(embed=done, view=self)
+        except discord.HTTPException:
+            await interaction.response.send_message(embed=done)
+
+
 async def _vote_gate(interaction: discord.Interaction, music, action: str) -> bool:
     """Gate for vote-enabled actions ('skip', 'leave').
 
     Returns True when the action should run NOW (the caller then executes it and
     sends its own response). Returns False when this function already responded —
-    either a vote was registered (public) or the user can't vote yet.
+    either a vote was registered (public, with a button to add more) or the user
+    can't vote yet.
 
     Bypasses: DJ-role/staff act instantly; a solo listener acts instantly.
-    Otherwise a strict majority of the humans in the voice channel must agree.
+    Otherwise a strict majority of the humans in the voice channel must agree,
+    collected via the VoteView button.
     """
     member = interaction.user
     gid = interaction.guild_id
@@ -3730,10 +3845,15 @@ async def _vote_gate(interaction: discord.Interaction, music, action: str) -> bo
         votes.clear()
         return True
 
+    view = VoteView(action)
     await interaction.response.send_message(
-        f"🗳️ Vote to **{action}** registered — **{len(votes)}/{needed}** needed. "
-        f"Others in the voice channel can run `/{action}` (or hit the button) to agree."
+        embed=_vote_embed(action, len(votes), needed, music.current),
+        view=view,
     )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException:
+        pass
     return False
 
 
@@ -3759,50 +3879,112 @@ def _normalize_raw_url(u: str) -> str:
     return u
 
 
-async def _fetch_update(url: str) -> tuple[bool, str]:
-    """Download the new bot.py, validate it compiles, back up the current file,
-    and write it in. Returns (ok, message). No git repo required.
+_GITHUB_RAW_RE = re.compile(
+    r"raw\.githubusercontent\.com/([^/]+)/([^/]+)/(?:refs/heads/)?([^/]+)/"
+)
 
-    Cache-busting: GitHub's raw URL is CDN-cached for ~5 min, which can serve
-    stale code right after a push. We append a timestamp query param and send
-    no-cache headers so /update always fetches the latest commit's content.
+
+async def _fetch_github_commit_sha(url: str) -> str | None:
+    """Best-effort: ask the GitHub API for the latest commit SHA of the branch
+    the raw URL points at. Returns None on any failure (no panic). Free, but
+    rate-limited (60/h per IP unauthenticated) — fine for occasional /update."""
+    m = _GITHUB_RAW_RE.search(url)
+    if not m:
+        return None
+    owner, repo, branch = m.groups()
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}",
+                headers={"User-Agent": "discord-bot-updater", "Accept": "application/vnd.github+json"},
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                return data.get("sha")
+    except Exception:
+        return None
+
+
+async def _fetch_update(url: str) -> dict:
+    """Download the new bot.py, validate it compiles, back up the current file,
+    and write it in. Returns a dict with:
+      ok          (bool)
+      message     (str)        — human-readable status / error
+      changed     (bool)       — True iff the downloaded content differs from current
+      bytes       (int)        — size of the downloaded content (0 on failure)
+      sha         (str)        — sha256 of the downloaded content (first 12 hex chars)
+      commit      (str | None) — github short commit sha when discoverable
+      url         (str)        — the URL fetched (with cache-buster)
+
+    Defeats GitHub's CDN cache via cache-buster query + no-cache headers.
+    No-ops cleanly when the downloaded file is byte-identical to the current
+    one (avoids a needless restart).
     """
     url = _normalize_raw_url(url)
-    # Append a unique query param to defeat the CDN cache.
     bust_url = url + ("&" if "?" in url else "?") + f"_={int(time.time())}"
     headers = {
         "Cache-Control": "no-cache, no-store, max-age=0",
         "Pragma": "no-cache",
-        # GitHub's raw CDN is slightly more aggressive when no UA is set.
         "User-Agent": "discord-bot-updater",
+    }
+    result: dict = {
+        "ok": False, "message": "", "changed": False,
+        "bytes": 0, "sha": "", "commit": None, "url": bust_url,
     }
     try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(bust_url, headers=headers) as resp:
                 if resp.status != 200:
-                    return False, f"download failed — HTTP {resp.status} from {bust_url}"
+                    result["message"] = f"HTTP {resp.status} from `{bust_url}`"
+                    return result
                 content = await resp.text()
     except Exception as e:
-        return False, f"download failed: {type(e).__name__}: {e}"
+        result["message"] = f"download failed: {type(e).__name__}: {e}"
+        return result
 
     if len(content) < 1000 or "import discord" not in content:
-        return False, "that URL didn't return a valid bot.py (too short / wrong file)."
-
-    # Compile-check BEFORE replacing so a broken download can't brick the bot.
+        result["message"] = "URL didn't return a valid `bot.py` (too short / wrong file)."
+        return result
     try:
         compile(content, "bot.py", "exec")
     except SyntaxError as e:
-        return False, f"downloaded file has a syntax error (not applied): {e}"
+        result["message"] = f"downloaded file has a syntax error (not applied): `{e}`"
+        return result
+
+    new_sha_full = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    result["sha"] = new_sha_full[:12]
+    result["bytes"] = len(content.encode("utf-8"))
 
     path = Path(__file__).resolve()
     try:
+        current = path.read_text(encoding="utf-8")
+    except Exception:
+        current = ""
+    current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
+
+    if new_sha_full == current_sha:
+        result["ok"] = True
+        result["changed"] = False
+        result["message"] = "Already on the latest version — no changes."
+        result["commit"] = await _fetch_github_commit_sha(url)
+        return result
+
+    try:
         backup = path.with_name(path.name + ".bak")
-        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        backup.write_text(current, encoding="utf-8")
         path.write_text(content, encoding="utf-8")
     except Exception as e:
-        return False, f"couldn't write the file: {type(e).__name__}: {e}"
-    return True, f"updated bot.py from {url} ({len(content):,} bytes; backup at {backup.name})"
+        result["message"] = f"couldn't write the file: {type(e).__name__}: {e}"
+        return result
+
+    result["ok"] = True
+    result["changed"] = True
+    result["message"] = f"Updated `bot.py` (backup at `{backup.name}`)"
+    result["commit"] = await _fetch_github_commit_sha(url)
+    return result
 
 
 def _restart_process() -> None:
@@ -4280,6 +4462,55 @@ async def specs_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+def _restart_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="🔄 Restarting",
+        description="Be right back — flushing state and re-execing the process.",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Uptime so far", value=_fmt_uptime(time.time() - START_TIME), inline=True)
+    embed.add_field(name="Active convos", value=str(len(history)), inline=True)
+    embed.add_field(name="Voice sessions", value=str(len(guild_music)), inline=True)
+    embed.set_footer(text=f"Python {platform.python_version()} • discord.py {discord.__version__}")
+    return embed
+
+
+def _update_embed(result: dict) -> discord.Embed:
+    """Build the /update result embed from _fetch_update's dict."""
+    if not result["ok"]:
+        embed = discord.Embed(
+            title="❌ Update failed",
+            description=result["message"],
+            color=0xED4245,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="No file written. Running version is unchanged.")
+        return embed
+    if not result["changed"]:
+        embed = discord.Embed(
+            title="✅ Already up to date",
+            description=result["message"],
+            color=0x57F287,
+            timestamp=datetime.now(timezone.utc),
+        )
+    else:
+        embed = discord.Embed(
+            title="✅ Update applied — restarting",
+            description=result["message"],
+            color=0x2ECC71,
+            timestamp=datetime.now(timezone.utc),
+        )
+    if result["bytes"]:
+        embed.add_field(name="Size", value=f"{result['bytes']:,} bytes", inline=True)
+    if result["sha"]:
+        embed.add_field(name="SHA-256", value=f"`{result['sha']}`", inline=True)
+    if result.get("commit"):
+        embed.add_field(name="Commit", value=f"`{result['commit'][:7]}`", inline=True)
+    embed.set_footer(text="Source: " + result["url"][:120])
+    return embed
+
+
 @tree.command(name="restart", description="Restart the bot (owner only).")
 async def restart_cmd(interaction: discord.Interaction):
     if not _is_owner(interaction):
@@ -4287,9 +4518,8 @@ async def restart_cmd(interaction: discord.Interaction):
             "Only the bot owner can restart me.", ephemeral=True
         )
         return
-    await interaction.response.send_message("🔄 Restarting… back in a few seconds.")
-    # Let the reply flush over the network, then re-exec.
-    await asyncio.sleep(1.0)
+    await interaction.response.send_message(embed=_restart_embed())
+    await asyncio.sleep(1.0)  # let the reply flush
     _restart_process()
 
 
@@ -4302,13 +4532,11 @@ async def update_cmd(interaction: discord.Interaction, url: str | None = None):
         )
         return
     await interaction.response.defer(ephemeral=True)
-    ok, msg = await _fetch_update(url or UPDATE_URL)
-    if not ok:
-        await interaction.followup.send(f"❌ Update failed: {msg}", ephemeral=True)
-        return
-    await interaction.followup.send(f"✅ {msg}\nRestarting…", ephemeral=True)
-    await asyncio.sleep(1.0)
-    _restart_process()
+    result = await _fetch_update(url or UPDATE_URL)
+    await interaction.followup.send(embed=_update_embed(result), ephemeral=True)
+    if result["ok"] and result["changed"]:
+        await asyncio.sleep(1.5)
+        _restart_process()
 
 
 @tree.command(name="play", description="Play a track/playlist (URL or search) or an uploaded audio file.")
