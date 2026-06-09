@@ -44,6 +44,7 @@ Free quota: 10,000 units/day = ~100 video searches/day. After that, requests jus
 Required by the `/play` voice commands. Without it, the music commands log a clear "disabled" message at startup and refuse to run; everything else still works.
 
 - **Linux/Pterodactyl**: `apt install ffmpeg` (or whatever your egg's package manager uses). Verify with `ffmpeg -version`.
+- **No root / host "doesn't support ffmpeg"**: download a static build (https://johnvansickle.com/ffmpeg/ or https://github.com/BtbN/FFmpeg-Builds/releases), extract just the single `ffmpeg` binary, and upload it to the same folder as `bot.py`. The bot finds it, fixes its exec permission automatically, and uses it — no install needed. (`FFMPEG_PATH=/custom/path` env var also works.)
 - **Windows**: download from https://ffmpeg.org/download.html and add to PATH.
 - **macOS**: `brew install ffmpeg`.
 

@@ -1652,10 +1652,13 @@ async def on_ready():
     if not MUSIC_AVAILABLE:
         missing = []
         if not FFMPEG_AVAILABLE:
-            missing.append("ffmpeg(system binary)")
+            missing.append("ffmpeg (no system binary — upload a static 'ffmpeg' "
+                           "build next to bot.py and restart)")
         if not YTDLP_AVAILABLE:
             missing.append("yt-dlp(pip)")
         print(f"  music: DISABLED — missing {', '.join(missing)}")
+    elif FFMPEG_PATH:
+        print(f"  ffmpeg: {FFMPEG_PATH}")
     elif YTDLP_COOKIES or YTDLP_COOKIES_FROM_BROWSER:
         src = YTDLP_COOKIES or f"browser:{YTDLP_COOKIES_FROM_BROWSER}"
         print(f"  yt-dlp cookies: ON ({src})")
@@ -1767,7 +1770,29 @@ async def on_voice_state_update(
 
 # ---------- Music playback (voice + yt-dlp + ffmpeg) ----------
 
-FFMPEG_PATH = shutil.which("ffmpeg")
+def _find_ffmpeg() -> str | None:
+    """Locate ffmpeg, in priority order:
+      1. FFMPEG_PATH env var (explicit override)
+      2. a static `ffmpeg` binary sitting next to bot.py — for hosts whose
+         container image has no system ffmpeg and no root to install one;
+         upload a single static-build binary and it Just Works. Panel file
+         managers usually drop the exec bit, so we re-chmod it best-effort.
+      3. the system PATH
+    """
+    env_path = os.environ.get("FFMPEG_PATH")
+    if env_path and Path(env_path).is_file():
+        return env_path
+    local = Path(__file__).resolve().parent / "ffmpeg"
+    if local.is_file():
+        try:
+            local.chmod(local.stat().st_mode | 0o755)
+        except Exception as e:
+            print(f"[startup] couldn't chmod local ffmpeg: {e}")
+        return str(local)
+    return shutil.which("ffmpeg")
+
+
+FFMPEG_PATH = _find_ffmpeg()
 FFMPEG_AVAILABLE = FFMPEG_PATH is not None
 MUSIC_AVAILABLE = FFMPEG_AVAILABLE and YTDLP_AVAILABLE
 
@@ -3617,7 +3642,10 @@ class MusicControls(discord.ui.View):
 def _music_unavailable_msg() -> str:
     missing = []
     if not FFMPEG_AVAILABLE:
-        missing.append("`ffmpeg` (system binary not on PATH)")
+        missing.append(
+            "`ffmpeg` — no system binary found. Fix without root: upload a "
+            "single static `ffmpeg` build into the bot's folder and restart"
+        )
     if not YTDLP_AVAILABLE:
         missing.append("`yt-dlp` (pip install yt-dlp)")
     return (
