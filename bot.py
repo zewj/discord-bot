@@ -3761,14 +3761,27 @@ def _normalize_raw_url(u: str) -> str:
 
 async def _fetch_update(url: str) -> tuple[bool, str]:
     """Download the new bot.py, validate it compiles, back up the current file,
-    and write it in. Returns (ok, message). No git repo required."""
+    and write it in. Returns (ok, message). No git repo required.
+
+    Cache-busting: GitHub's raw URL is CDN-cached for ~5 min, which can serve
+    stale code right after a push. We append a timestamp query param and send
+    no-cache headers so /update always fetches the latest commit's content.
+    """
     url = _normalize_raw_url(url)
+    # Append a unique query param to defeat the CDN cache.
+    bust_url = url + ("&" if "?" in url else "?") + f"_={int(time.time())}"
+    headers = {
+        "Cache-Control": "no-cache, no-store, max-age=0",
+        "Pragma": "no-cache",
+        # GitHub's raw CDN is slightly more aggressive when no UA is set.
+        "User-Agent": "discord-bot-updater",
+    }
     try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
+            async with session.get(bust_url, headers=headers) as resp:
                 if resp.status != 200:
-                    return False, f"download failed — HTTP {resp.status} from {url}"
+                    return False, f"download failed — HTTP {resp.status} from {bust_url}"
                 content = await resp.text()
     except Exception as e:
         return False, f"download failed: {type(e).__name__}: {e}"
