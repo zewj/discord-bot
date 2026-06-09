@@ -2904,6 +2904,39 @@ async def resolve_apple_music_track(url: str) -> str | None:
     return f"{title} {artist}".strip()
 
 
+# ---- YouTube search query biasing ----------------------------------------
+# Pushes yt-dlp searches toward clean audio uploads instead of music videos.
+# Strips noisy video qualifiers and appends "audio" — unless the query already
+# specifies a format (audio/lyric/cover/nightcore/etc.) we don't want to clobber.
+
+_MUSIC_VIDEO_NOISE_RE = re.compile(
+    r"\b("
+    r"official\s+music\s+video|official\s+video|music\s+video|videoclip|"
+    r"video\s+oficial|clip\s+oficial|(?:official\s+)?m\.?v\.?"
+    r")\b",
+    re.IGNORECASE,
+)
+_AUDIO_FORMAT_HINT_RE = re.compile(
+    r"\b("
+    r"audio|lyric[s]?|topic|nightcore|slowed|sped[- ]?up|reverb|"
+    r"remix|cover|acoustic|piano|instrumental|karaoke"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _bias_audio_query(query: str) -> str:
+    """Return `query` rewritten to prefer YouTube audio uploads. Idempotent."""
+    q = _MUSIC_VIDEO_NOISE_RE.sub(" ", query)
+    q = re.sub(r"[\(\[\{]\s*[\)\]\}]", " ", q)   # drop empties left by the sub
+    q = re.sub(r"\s{2,}", " ", q).strip(" -–—|")
+    if not q:
+        return query.strip()                    # nothing left → don't append blind "audio"
+    if not _AUDIO_FORMAT_HINT_RE.search(q):
+        q = f"{q} audio"
+    return q
+
+
 async def resolve_track(
     query: str, requester_id: int, requester_name: str
 ) -> Track | None:
@@ -2930,7 +2963,7 @@ async def resolve_track(
             else:
                 print(f"[music] spotify resolution failed for {query!r}")
             return None
-        yt_query = f"ytsearch1:{resolved}"
+        yt_query = f"ytsearch1:{_bias_audio_query(resolved)}"
         source_label = "Spotify (via YouTube)"
         print(f"[music] spotify → '{resolved}' → YouTube search")
     elif _is_apple_music_url(query):
@@ -2939,11 +2972,14 @@ async def resolve_track(
             print(f"[music] apple music resolution failed for {query!r} "
                   "(album URLs without ?i= track id aren't supported yet)")
             return None
-        yt_query = f"ytsearch1:{resolved}"
+        yt_query = f"ytsearch1:{_bias_audio_query(resolved)}"
         source_label = "Apple Music (via YouTube)"
         print(f"[music] apple music → '{resolved}' → YouTube search")
     elif _is_soundcloud_url(query):
         source_label = "SoundCloud"
+    elif "://" not in query:
+        # Free-text user search ("queen bohemian rhapsody") — bias toward audio.
+        yt_query = f"ytsearch1:{_bias_audio_query(query)}"
 
     def _extract():
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
@@ -3126,7 +3162,7 @@ async def _resolve_spotify_collection(
             requester_id=requester_id,
             requester_name=requester_name,
             source_label="Spotify (via YouTube)",
-            resolve_query=f"ytsearch1:{title} {artists}".strip(),
+            resolve_query=f"ytsearch1:{_bias_audio_query(f'{title} {artists}'.strip())}",
         ))
     if tracks:
         return tracks, name
@@ -3148,7 +3184,7 @@ async def _resolve_spotify_collection(
             requester_id=requester_id,
             requester_name=requester_name,
             source_label="Spotify (via YouTube)",
-            resolve_query=f"ytsearch1:{title} {artists}".strip(),
+            resolve_query=f"ytsearch1:{_bias_audio_query(f'{title} {artists}'.strip())}",
         ))
     print(f"[spotify] embed scrape recovered {len(tracks)} track(s) from '{scraped_name}'")
     return (tracks, scraped_name) if tracks else None
@@ -3202,7 +3238,7 @@ async def _resolve_apple_album(
             requester_id=requester_id,
             requester_name=requester_name,
             source_label="Apple Music (via YouTube)",
-            resolve_query=f"ytsearch1:{title} {artist}".strip(),
+            resolve_query=f"ytsearch1:{_bias_audio_query(f'{title} {artist}'.strip())}",
         ))
     return (tracks[:PLAYLIST_MAX], name) if tracks else None
 
@@ -3296,7 +3332,7 @@ async def fetch_autoplay_track(
         if seed_terms:
             try:
                 info = await asyncio.wait_for(
-                    asyncio.to_thread(_flat, f"ytsearch10:{seed_terms}"),
+                    asyncio.to_thread(_flat, f"ytsearch10:{_bias_audio_query(seed_terms)}"),
                     timeout=MUSIC_SEARCH_TIMEOUT,
                 )
                 entries = [e for e in (info.get("entries") or []) if e]
