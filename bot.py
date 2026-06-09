@@ -2318,6 +2318,10 @@ class GuildMusic:
             )
             source = discord.PCMVolumeTransformer(source, volume=self.volume)
             self.voice.play(source, after=self._after_play)
+            # Diagnostic: timestamps the moment a new ffmpeg stream goes live so
+            # you can correlate any audio glitch in the host log.
+            print(f"[music guild={self.guild_id}] ▶ play start "
+                  f"src='{next_track.source_label}' title={next_track.title!r}")
         except Exception as e:
             print(f"[music guild={self.guild_id}] play failed: {e}")
             self.current = None
