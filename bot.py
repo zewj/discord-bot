@@ -2722,6 +2722,7 @@ def _is_soundcloud_url(query: str) -> bool:
 async def _get_spotify_token() -> str | None:
     global _spotify_token, _spotify_token_expires_at
     if not SPOTIFY_AVAILABLE:
+        print("[spotify] SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET not set")
         return None
     if _spotify_token and time.time() < _spotify_token_expires_at - 60:
         return _spotify_token
@@ -2734,11 +2735,12 @@ async def _get_spotify_token() -> str | None:
                 data={"grant_type": "client_credentials"},
             ) as resp:
                 if resp.status != 200:
-                    print(f"[spotify] auth HTTP {resp.status}")
+                    body = (await resp.text())[:200].replace("\n", " ")
+                    print(f"[spotify] auth HTTP {resp.status} — {body}")
                     return None
                 data = await resp.json()
     except Exception as e:
-        print(f"[spotify] auth failed: {e}")
+        print(f"[spotify] auth failed: {type(e).__name__}: {e}")
         return None
     _spotify_token = data.get("access_token")
     _spotify_token_expires_at = time.time() + float(data.get("expires_in", 3600) or 3600)
@@ -2991,11 +2993,14 @@ async def _resolve_spotify_collection(
     rx = SPOTIFY_PLAYLIST_RE if kind == "playlist" else SPOTIFY_ALBUM_RE
     m = rx.search(url)
     if not m:
+        print(f"[spotify] {kind} URL didn't match the expected pattern: {url}")
         return None
     cid = m.group(1)
     token = await _get_spotify_token()
     if not token:
+        print(f"[spotify] {kind} aborted — no auth token (see prior log line for why)")
         return None
+    print(f"[spotify] fetching {kind} id={cid}")
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -3004,15 +3009,17 @@ async def _resolve_spotify_collection(
                 headers={"Authorization": f"Bearer {token}"},
             ) as resp:
                 if resp.status != 200:
-                    print(f"[spotify] {kind} lookup HTTP {resp.status}")
+                    body = (await resp.text())[:200].replace("\n", " ")
+                    print(f"[spotify] {kind} lookup HTTP {resp.status} id={cid} — {body}")
                     return None
                 data = await resp.json()
     except Exception as e:
-        print(f"[spotify] {kind} lookup failed: {e}")
+        print(f"[spotify] {kind} lookup failed: {type(e).__name__}: {e}")
         return None
 
     name = data.get("name") or f"Spotify {kind}"
     items = (data.get("tracks") or {}).get("items") or []
+    print(f"[spotify] {kind} '{name}' returned {len(items)} item(s)")
     tracks: list[Track] = []
     for it in items[:PLAYLIST_MAX]:
         t = it.get("track") if kind == "playlist" else it
