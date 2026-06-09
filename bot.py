@@ -2747,6 +2747,92 @@ async def _get_spotify_token() -> str | None:
     return _spotify_token
 
 
+# Spotify cut off API access to editorial / algorithmic playlists in late 2024
+# (the API returns 200 with zero items). The /embed/ page still renders the
+# track list publicly, so we scrape it as a fallback. Fragile — if Spotify
+# changes the embed page format this breaks, at which point the API-only path
+# still works for user-made playlists. Caller logs include this URL.
+_SPOTIFY_EMBED_RESOURCE_RE = re.compile(
+    r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL
+)
+_SPOTIFY_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+async def _scrape_spotify_collection(
+    kind: str, cid: str
+) -> tuple[str, list[tuple[str, str]]] | None:
+    """Last-resort fallback for editorial playlists: read the public Spotify
+    /embed/ page, which inlines the track list as JSON in __NEXT_DATA__.
+
+    Returns (collection_name, [(track_title, artists_joined), ...]) or None.
+    """
+    embed_url = f"https://open.spotify.com/embed/{kind}/{cid}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                embed_url, headers={"User-Agent": _SPOTIFY_BROWSER_UA}
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[spotify] embed scrape HTTP {resp.status} url={embed_url}")
+                    return None
+                html = await resp.text()
+    except Exception as e:
+        print(f"[spotify] embed scrape failed: {type(e).__name__}: {e}")
+        return None
+
+    m = _SPOTIFY_EMBED_RESOURCE_RE.search(html)
+    if not m:
+        print(f"[spotify] embed scrape: __NEXT_DATA__ not found at {embed_url} "
+              "(page format may have changed)")
+        return None
+    try:
+        blob = json.loads(m.group(1))
+    except Exception as e:
+        print(f"[spotify] embed JSON parse failed: {e}")
+        return None
+
+    # Walk the blob for the entity dict. The shape varies a little across
+    # rollouts; both common locations are checked.
+    entity = None
+    try:
+        props = blob.get("props", {}).get("pageProps", {})
+        entity = (
+            props.get("state", {}).get("data", {}).get("entity")
+            or props.get("entity")
+            or props.get("trackList") and {"trackList": props["trackList"]}
+        )
+    except Exception:
+        pass
+    if not entity:
+        print("[spotify] embed scrape: entity not found in JSON blob")
+        return None
+
+    name = entity.get("name") or f"Spotify {kind}"
+    items = entity.get("trackList") or entity.get("tracks") or []
+    pairs: list[tuple[str, str]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        title = (it.get("title") or it.get("name") or "").strip()
+        if not title:
+            continue
+        # Artist field can be "Artist", "artists" [{"name":...}], or "subtitle".
+        artists = it.get("artists")
+        if isinstance(artists, list) and artists:
+            artist_str = ", ".join(
+                (a.get("name") if isinstance(a, dict) else str(a)) or ""
+                for a in artists
+            ).strip(", ")
+        else:
+            artist_str = (it.get("subtitle") or "").strip()
+        pairs.append((title, artist_str))
+    return (name, pairs) if pairs else None
+
+
 async def resolve_spotify_track(url: str) -> str | None:
     """Spotify track URL/URI → 'Title Artist' string for a YouTube search.
     Returns None if the URL doesn't match, creds aren't set, or the API fails."""
@@ -3042,7 +3128,30 @@ async def _resolve_spotify_collection(
             source_label="Spotify (via YouTube)",
             resolve_query=f"ytsearch1:{title} {artists}".strip(),
         ))
-    return (tracks, name) if tracks else None
+    if tracks:
+        return tracks, name
+
+    # API returned an empty list — the editorial-playlist block. Scrape the
+    # public Spotify /embed/ page instead, which still renders the track list.
+    print(f"[spotify] {kind} '{name}' empty via API — trying embed scrape fallback")
+    scraped = await _scrape_spotify_collection(kind, cid)
+    if not scraped:
+        return None
+    scraped_name, pairs = scraped
+    tracks = []
+    for title, artists in pairs[:PLAYLIST_MAX]:
+        tracks.append(Track(
+            stream_url=None,
+            webpage_url=f"https://open.spotify.com/{kind}/{cid}",
+            title=f"{title} — {artists}" if artists else title,
+            duration=None,
+            requester_id=requester_id,
+            requester_name=requester_name,
+            source_label="Spotify (via YouTube)",
+            resolve_query=f"ytsearch1:{title} {artists}".strip(),
+        ))
+    print(f"[spotify] embed scrape recovered {len(tracks)} track(s) from '{scraped_name}'")
+    return (tracks, scraped_name) if tracks else None
 
 
 async def _resolve_apple_album(
