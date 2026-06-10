@@ -1797,12 +1797,12 @@ FFMPEG_AVAILABLE = FFMPEG_PATH is not None
 MUSIC_AVAILABLE = FFMPEG_AVAILABLE and YTDLP_AVAILABLE
 
 MUSIC_IDLE_TIMEOUT = 5 * 60       # disconnect after this many seconds of nothing playing
-MUSIC_MAX_QUEUE = 100             # cap per guild
+MUSIC_MAX_QUEUE = 1000            # cap per guild — generous; lazy resolution is cheap
 MUSIC_SEARCH_TIMEOUT = 15         # yt-dlp resolution timeout (seconds)
 MUSIC_EMBED_COLOR = 0xED4245      # Vivid red — distinct from chat embeds
 MUSIC_PROGRESS_WIDTH = 18         # progress-bar character width
 PROGRESS_UPDATE_INTERVAL = 8      # seconds between live progress-bar message edits
-PLAYLIST_MAX = 50                 # cap tracks pulled from one playlist/album
+PLAYLIST_MAX = 500                # cap tracks pulled from one playlist/album
 
 YTDL_OPTS = {
     # Permissive base selector + format_sort for quality preference. Hard ext/
@@ -1846,6 +1846,7 @@ YTDL_FLAT_OPTS = {
     **YTDL_OPTS,
     "noplaylist": False,
     "extract_flat": "in_playlist",
+    "playlistend": PLAYLIST_MAX,   # cap entries pulled at extraction time
 }
 
 # -nostdin keeps ffmpeg from grabbing the bot's stdin and racing other input.
@@ -3156,24 +3157,39 @@ async def _resolve_spotify_collection(
         return None
     print(f"[spotify] fetching {kind} id={cid}")
     try:
-        timeout = aiohttp.ClientTimeout(total=10)
+        timeout = aiohttp.ClientTimeout(total=15)
+        headers = {"Authorization": f"Bearer {token}"}
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(
-                f"https://api.spotify.com/v1/{kind}s/{cid}",
-                headers={"Authorization": f"Bearer {token}"},
+                f"https://api.spotify.com/v1/{kind}s/{cid}", headers=headers,
             ) as resp:
                 if resp.status != 200:
                     body = (await resp.text())[:200].replace("\n", " ")
                     print(f"[spotify] {kind} lookup HTTP {resp.status} id={cid} — {body}")
                     return None
                 data = await resp.json()
+
+            name = data.get("name") or f"Spotify {kind}"
+            items = (data.get("tracks") or {}).get("items") or []
+            next_url = (data.get("tracks") or {}).get("next")
+
+            # Spotify paginates playlists/albums at 100 items/page. Walk the
+            # `next` URLs until we've collected up to PLAYLIST_MAX entries.
+            while next_url and len(items) < PLAYLIST_MAX:
+                async with session.get(next_url, headers=headers) as resp:
+                    if resp.status != 200:
+                        print(f"[spotify] {kind} pagination HTTP {resp.status} — "
+                              f"stopping at {len(items)} item(s)")
+                        break
+                    page = await resp.json()
+                items.extend(page.get("items") or [])
+                next_url = page.get("next")
+            print(f"[spotify] {kind} '{name}' loaded {len(items)} item(s) "
+                  f"({'capped at PLAYLIST_MAX' if len(items) >= PLAYLIST_MAX else 'full playlist'})")
     except Exception as e:
         print(f"[spotify] {kind} lookup failed: {type(e).__name__}: {e}")
         return None
 
-    name = data.get("name") or f"Spotify {kind}"
-    items = (data.get("tracks") or {}).get("items") or []
-    print(f"[spotify] {kind} '{name}' returned {len(items)} item(s)")
     tracks: list[Track] = []
     for it in items[:PLAYLIST_MAX]:
         t = it.get("track") if kind == "playlist" else it
