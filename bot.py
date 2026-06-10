@@ -2962,6 +2962,7 @@ _AUDIO_FORMAT_HINT_RE = re.compile(
 
 def _bias_audio_query(query: str) -> str:
     """Return `query` rewritten to prefer YouTube audio uploads. Idempotent."""
+    query = query.replace("\xa0", " ")  # Spotify metadata uses NBSP between artists
     q = _MUSIC_VIDEO_NOISE_RE.sub(" ", query)
     q = re.sub(r"[\(\[\{]\s*[\)\]\}]", " ", q)   # drop empties left by the sub
     q = re.sub(r"\s{2,}", " ", q).strip(" -–—|")
@@ -3012,6 +3013,12 @@ async def resolve_track(
         print(f"[music] apple music → '{resolved}' → YouTube search")
     elif _is_soundcloud_url(query):
         source_label = "SoundCloud"
+    elif query.startswith(("ytsearch", "ytmsearch", "scsearch")):
+        # Already an explicit yt-dlp search query — playlist lazy tracks build
+        # these with the audio bias pre-applied. Re-wrapping would produce
+        # "ytsearch1:ytsearch1:…" and search for that literal junk (every
+        # playlist track failed this way). Pass through untouched.
+        pass
     elif "://" not in query:
         # Free-text user search ("queen bohemian rhapsody") — bias toward audio.
         yt_query = f"ytsearch1:{_bias_audio_query(query)}"
