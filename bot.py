@@ -1803,6 +1803,8 @@ MUSIC_EMBED_COLOR = 0xED4245      # Vivid red — distinct from chat embeds
 MUSIC_PROGRESS_WIDTH = 18         # progress-bar character width
 PROGRESS_UPDATE_INTERVAL = 8      # seconds between live progress-bar message edits
 PLAYLIST_MAX = 500                # cap tracks pulled from one playlist/album
+PLAYLIST_FAST_START = 5           # entries fetched up-front so playback starts fast;
+                                  # the rest of the playlist loads in the background
 
 YTDL_OPTS = {
     # Permissive base selector + format_sort for quality preference. Hard ext/
@@ -3096,17 +3098,47 @@ def _is_playlist_url(query: str) -> bool:
 
 async def _resolve_ytdlp_playlist(
     query: str, requester_id: int, requester_name: str
-) -> tuple[list[Track], str] | None:
-    """YouTube playlist / SoundCloud set → lazy Tracks via flat extraction."""
+) -> tuple[list[Track], str, "object | None"] | None:
+    """YouTube playlist / SoundCloud set → lazy Tracks via flat extraction.
+
+    Fast-start: extracts only the first PLAYLIST_FAST_START entries up front so
+    playback can begin in seconds; returns a `fetch_rest` async callable that
+    pulls entries FAST_START+1..PLAYLIST_MAX for background queueing (or None
+    when the playlist was short enough to fit in the first batch).
+    """
     is_soundcloud = "soundcloud.com" in query.lower()
 
-    def _extract():
-        with yt_dlp.YoutubeDL(YTDL_FLAT_OPTS) as ydl:
+    def _extract(start: int, end: int):
+        opts = {**YTDL_FLAT_OPTS, "playliststart": start, "playlistend": end}
+        with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(query, download=False)
+
+    def _build(entries: list, cap: int) -> list[Track]:
+        out: list[Track] = []
+        for e in entries[:cap]:
+            url = e.get("url") or e.get("webpage_url")
+            if not url and e.get("id"):
+                url = f"https://www.youtube.com/watch?v={e['id']}"
+            if not url:
+                continue
+            out.append(Track(
+                stream_url=None,
+                webpage_url=e.get("webpage_url") or url,
+                title=e.get("title") or "(untitled)",
+                duration=int(e["duration"]) if e.get("duration") else None,
+                requester_id=requester_id,
+                requester_name=requester_name,
+                thumbnail_url=e.get("thumbnail"),
+                uploader=e.get("uploader") or e.get("channel"),
+                source_label="SoundCloud" if is_soundcloud else "YouTube",
+                resolve_query=url,
+            ))
+        return out
 
     try:
         info = await asyncio.wait_for(
-            asyncio.to_thread(_extract), timeout=MUSIC_SEARCH_TIMEOUT * 2
+            asyncio.to_thread(_extract, 1, PLAYLIST_FAST_START),
+            timeout=MUSIC_SEARCH_TIMEOUT * 2,
         )
     except Exception as e:
         print(f"[music] playlist extract failed for {query!r}: {e}")
@@ -3118,33 +3150,37 @@ async def _resolve_ytdlp_playlist(
     if not entries:
         return None
     title = info.get("title") or ("SoundCloud set" if is_soundcloud else "playlist")
+    first = _build(entries, PLAYLIST_FAST_START)
+    if not first:
+        return None
 
-    tracks: list[Track] = []
-    for e in entries[:PLAYLIST_MAX]:
-        url = e.get("url") or e.get("webpage_url")
-        if not url and e.get("id"):
-            url = f"https://www.youtube.com/watch?v={e['id']}"
-        if not url:
-            continue
-        tracks.append(Track(
-            stream_url=None,
-            webpage_url=e.get("webpage_url") or url,
-            title=e.get("title") or "(untitled)",
-            duration=int(e["duration"]) if e.get("duration") else None,
-            requester_id=requester_id,
-            requester_name=requester_name,
-            thumbnail_url=e.get("thumbnail"),
-            uploader=e.get("uploader") or e.get("channel"),
-            source_label="SoundCloud" if is_soundcloud else "YouTube",
-            resolve_query=url,
-        ))
-    return (tracks, title) if tracks else None
+    fetch_rest = None
+    if len(entries) >= PLAYLIST_FAST_START:
+        # There may be more — background loader pulls the remainder.
+        async def fetch_rest() -> list[Track]:
+            try:
+                info2 = await asyncio.wait_for(
+                    asyncio.to_thread(_extract, PLAYLIST_FAST_START + 1, PLAYLIST_MAX),
+                    timeout=MUSIC_SEARCH_TIMEOUT * 4,
+                )
+            except Exception as e:
+                print(f"[music] playlist rest-fetch failed for {query!r}: {e}")
+                return []
+            ents = [e for e in ((info2 or {}).get("entries") or []) if e]
+            return _build(ents, PLAYLIST_MAX - PLAYLIST_FAST_START)
+
+    return first, title, fetch_rest
 
 
 async def _resolve_spotify_collection(
     url: str, kind: str, requester_id: int, requester_name: str
-) -> tuple[list[Track], str] | None:
-    """Spotify playlist or album → lazy Tracks (each a YouTube search)."""
+) -> tuple[list[Track], str, "object | None"] | None:
+    """Spotify playlist or album → lazy Tracks (each a YouTube search).
+
+    Fast-start: returns after page 1 of the API (≤100 tracks) so playback can
+    begin immediately, plus a `fetch_rest` async callable that walks the
+    remaining pages in the background (None when page 1 covered everything).
+    """
     rx = SPOTIFY_PLAYLIST_RE if kind == "playlist" else SPOTIFY_ALBUM_RE
     m = rx.search(url)
     if not m:
@@ -3168,52 +3204,72 @@ async def _resolve_spotify_collection(
                     print(f"[spotify] {kind} lookup HTTP {resp.status} id={cid} — {body}")
                     return None
                 data = await resp.json()
-
-            name = data.get("name") or f"Spotify {kind}"
-            items = (data.get("tracks") or {}).get("items") or []
-            next_url = (data.get("tracks") or {}).get("next")
-
-            # Spotify paginates playlists/albums at 100 items/page. Walk the
-            # `next` URLs until we've collected up to PLAYLIST_MAX entries.
-            while next_url and len(items) < PLAYLIST_MAX:
-                async with session.get(next_url, headers=headers) as resp:
-                    if resp.status != 200:
-                        print(f"[spotify] {kind} pagination HTTP {resp.status} — "
-                              f"stopping at {len(items)} item(s)")
-                        break
-                    page = await resp.json()
-                items.extend(page.get("items") or [])
-                next_url = page.get("next")
-            print(f"[spotify] {kind} '{name}' loaded {len(items)} item(s) "
-                  f"({'capped at PLAYLIST_MAX' if len(items) >= PLAYLIST_MAX else 'full playlist'})")
     except Exception as e:
         print(f"[spotify] {kind} lookup failed: {type(e).__name__}: {e}")
         return None
 
-    tracks: list[Track] = []
-    for it in items[:PLAYLIST_MAX]:
-        t = it.get("track") if kind == "playlist" else it
-        if not t:
-            continue
-        title = (t.get("name") or "").strip()
-        if not title:
-            continue
-        artists = ", ".join(
-            a.get("name", "") for a in (t.get("artists") or []) if a.get("name")
-        )
-        spotify_url = (t.get("external_urls") or {}).get("spotify") or url
-        tracks.append(Track(
-            stream_url=None,
-            webpage_url=spotify_url,
-            title=f"{title} — {artists}" if artists else title,
-            duration=int(t["duration_ms"] / 1000) if t.get("duration_ms") else None,
-            requester_id=requester_id,
-            requester_name=requester_name,
-            source_label="Spotify (via YouTube)",
-            resolve_query=f"ytsearch1:{_bias_audio_query(f'{title} {artists}'.strip())}",
-        ))
+    name = data.get("name") or f"Spotify {kind}"
+    items = (data.get("tracks") or {}).get("items") or []
+    next_url = (data.get("tracks") or {}).get("next")
+    print(f"[spotify] {kind} '{name}' page 1: {len(items)} item(s)"
+          + (" — more pages load in background" if next_url else ""))
+
+    def _build(raw_items: list, cap: int) -> list[Track]:
+        out: list[Track] = []
+        for it in raw_items[:cap]:
+            t = it.get("track") if kind == "playlist" else it
+            if not t:
+                continue
+            title = (t.get("name") or "").strip()
+            if not title:
+                continue
+            artists = ", ".join(
+                a.get("name", "") for a in (t.get("artists") or []) if a.get("name")
+            )
+            spotify_url = (t.get("external_urls") or {}).get("spotify") or url
+            out.append(Track(
+                stream_url=None,
+                webpage_url=spotify_url,
+                title=f"{title} — {artists}" if artists else title,
+                duration=int(t["duration_ms"] / 1000) if t.get("duration_ms") else None,
+                requester_id=requester_id,
+                requester_name=requester_name,
+                source_label="Spotify (via YouTube)",
+                resolve_query=f"ytsearch1:{_bias_audio_query(f'{title} {artists}'.strip())}",
+            ))
+        return out
+
+    tracks = _build(items, PLAYLIST_MAX)
     if tracks:
-        return tracks, name
+        fetch_rest = None
+        if next_url and len(items) < PLAYLIST_MAX:
+            have = len(items)
+
+            async def fetch_rest() -> list[Track]:
+                tok = await _get_spotify_token()
+                if not tok:
+                    return []
+                hdrs = {"Authorization": f"Bearer {tok}"}
+                rest_items: list = []
+                nxt = next_url
+                try:
+                    timeout = aiohttp.ClientTimeout(total=20)
+                    async with aiohttp.ClientSession(timeout=timeout) as s:
+                        while nxt and have + len(rest_items) < PLAYLIST_MAX:
+                            async with s.get(nxt, headers=hdrs) as r:
+                                if r.status != 200:
+                                    print(f"[spotify] {kind} pagination HTTP {r.status} — stopping")
+                                    break
+                                page = await r.json()
+                            rest_items.extend(page.get("items") or [])
+                            nxt = page.get("next")
+                except Exception as e:
+                    print(f"[spotify] {kind} pagination failed: {type(e).__name__}: {e}")
+                built = _build(rest_items, PLAYLIST_MAX - have)
+                print(f"[spotify] {kind} '{name}' background-loaded {len(built)} more track(s)")
+                return built
+
+        return tracks, name, fetch_rest
 
     # API returned an empty list — the editorial-playlist block. Scrape the
     # public Spotify /embed/ page instead, which still renders the track list.
@@ -3235,13 +3291,14 @@ async def _resolve_spotify_collection(
             resolve_query=f"ytsearch1:{_bias_audio_query(f'{title} {artists}'.strip())}",
         ))
     print(f"[spotify] embed scrape recovered {len(tracks)} track(s) from '{scraped_name}'")
-    return (tracks, scraped_name) if tracks else None
+    return (tracks, scraped_name, None) if tracks else None
 
 
 async def _resolve_apple_album(
     url: str, requester_id: int, requester_name: str
-) -> tuple[list[Track], str] | None:
+) -> tuple[list[Track], str, None] | None:
     """Apple Music album → lazy Tracks via the free iTunes lookup API.
+    Albums are small + the lookup is one fast call, so no fast-start split.
     Curated Apple Music playlists aren't in the iTunes API, so those return None."""
     if "/playlist/" in url.lower():
         return None  # unsupported — caller surfaces a clear message
@@ -3288,14 +3345,16 @@ async def _resolve_apple_album(
             source_label="Apple Music (via YouTube)",
             resolve_query=f"ytsearch1:{_bias_audio_query(f'{title} {artist}'.strip())}",
         ))
-    return (tracks[:PLAYLIST_MAX], name) if tracks else None
+    return (tracks[:PLAYLIST_MAX], name, None) if tracks else None
 
 
 async def resolve_playlist(
     query: str, requester_id: int, requester_name: str
-) -> tuple[list[Track], str] | None:
+) -> tuple[list[Track], str, "object | None"] | None:
     """Route a playlist/album URL to the right resolver. Returns
-    (lazy_tracks, collection_title) or None."""
+    (first_tracks, collection_title, fetch_rest_or_None) — fetch_rest is an
+    async callable that loads the remainder of the playlist for background
+    queueing, or None when first_tracks already covers everything."""
     if not YTDLP_AVAILABLE:
         return None
     q = query.lower()
@@ -4583,6 +4642,31 @@ async def update_cmd(interaction: discord.Interaction, url: str | None = None):
         _restart_process()
 
 
+def _swallow_task_exc(task: asyncio.Task) -> None:
+    """Done-callback that retrieves a task's exception so an early return in
+    the caller can't leave an 'exception was never retrieved' warning."""
+    try:
+        task.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        pass
+
+
+async def _await_voice(interaction: discord.Interaction, voice_task: asyncio.Task) -> bool:
+    """Await the parallel voice-connect task; on failure, reply and return False."""
+    try:
+        await voice_task
+        return True
+    except discord.ClientException as e:
+        await interaction.followup.send(f"Voice connection failed: {e}", ephemeral=True)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("Voice connection timed out.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(
+            f"Voice connection error: {type(e).__name__}: {e}", ephemeral=True
+        )
+    return False
+
+
 @tree.command(name="play", description="Play a track/playlist (URL or search) or an uploaded audio file.")
 @app_commands.describe(
     query="A URL (track or playlist) or search terms",
@@ -4626,19 +4710,11 @@ async def play_cmd(
     music = get_or_create_music(interaction.guild.id)
     music.last_text_channel_id = interaction.channel.id
 
-    try:
-        await music.ensure_voice(channel)
-    except discord.ClientException as e:
-        await interaction.followup.send(f"Voice connection failed: {e}", ephemeral=True)
-        return
-    except asyncio.TimeoutError:
-        await interaction.followup.send("Voice connection timed out.", ephemeral=True)
-        return
-    except Exception as e:
-        await interaction.followup.send(
-            f"Voice connection error: {type(e).__name__}: {e}", ephemeral=True
-        )
-        return
+    # Connect to voice IN PARALLEL with track/playlist resolution — shaves the
+    # handshake time off the wait. Awaited (with error handling) right before
+    # anything is enqueued, since _advance refuses to play without a connection.
+    voice_task = asyncio.create_task(music.ensure_voice(channel))
+    voice_task.add_done_callback(_swallow_task_exc)
 
     if len(music.queue) >= MUSIC_MAX_QUEUE:
         await interaction.followup.send(
@@ -4699,18 +4775,59 @@ async def play_cmd(
                 f"Couldn't queue `{query[:200]}`.\n{hint}", ephemeral=True
             )
             return
-        tracks, coll_title = result
-        added = await music.enqueue_many(tracks)
+        first_tracks, coll_title, fetch_rest = result
+        if not await _await_voice(interaction, voice_task):
+            return
+        added = await music.enqueue_many(first_tracks)
+
+        if fetch_rest is None:
+            # Whole playlist fit in the first batch.
+            embed = discord.Embed(
+                description=(
+                    f"**➕ Queued {added} track{'s' if added != 1 else ''}** "
+                    f"from **{coll_title}**"
+                ),
+                color=MUSIC_EMBED_COLOR,
+            )
+            if added < len(first_tracks):
+                embed.set_footer(text=f"Capped at {MUSIC_MAX_QUEUE}-track queue limit")
+            await interaction.followup.send(embed=embed)
+            return
+
+        # Fast-start: playback is already beginning off the first batch; load
+        # the remainder in the background and update the message when done.
         embed = discord.Embed(
             description=(
-                f"**➕ Queued {added} track{'s' if added != 1 else ''}** "
-                f"from **{coll_title}**"
+                f"**▶ Starting** with **{added}** track{'s' if added != 1 else ''} "
+                f"from **{coll_title}** — loading the rest in the background…"
             ),
             color=MUSIC_EMBED_COLOR,
         )
-        if added < len(tracks):
-            embed.set_footer(text=f"Capped at {MUSIC_MAX_QUEUE}-track queue limit")
-        await interaction.followup.send(embed=embed)
+        msg = await interaction.followup.send(embed=embed)
+
+        async def _finish_playlist_load():
+            try:
+                rest = await fetch_rest()
+                more = await music.enqueue_many(rest) if rest else 0
+                total = added + more
+                done = discord.Embed(
+                    description=(
+                        f"**➕ Queued {total} track{'s' if total != 1 else ''}** "
+                        f"from **{coll_title}**"
+                    ),
+                    color=MUSIC_EMBED_COLOR,
+                )
+                if rest and more < len(rest):
+                    done.set_footer(text=f"Capped at {MUSIC_MAX_QUEUE}-track queue limit")
+                if msg is not None:
+                    try:
+                        await msg.edit(embed=done)
+                    except discord.HTTPException:
+                        pass
+            except Exception as e:
+                print(f"[music] playlist background load failed: {type(e).__name__}: {e}")
+
+        bot.loop.create_task(_finish_playlist_load())
         return
     # ---- Single track (URL or search) ----
     else:
@@ -4737,6 +4854,8 @@ async def play_cmd(
             )
             return
 
+    if not await _await_voice(interaction, voice_task):
+        return
     started_immediately = (music.current is None) and not music.is_active()
     position = await music.enqueue(track)
     if started_immediately:
