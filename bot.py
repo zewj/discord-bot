@@ -97,6 +97,61 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 
+# ---------- Self-update crash rollback (runs before any risky import) ----------
+# /update overwrites this very file and re-execs. The download is compile-checked,
+# but a file that COMPILES can still die at startup (bad import, module-level
+# error) — which would crash-loop the bot with no way to /update out of it.
+# So /update leaves a marker file, and this guard runs on every boot:
+#     marker absent        -> normal boot, do nothing
+#     marker attempts == 0 -> first boot of a fresh update; record the attempt
+#     marker attempts >= 1 -> the previous post-update boot never reached
+#                             on_ready, so that update is bad => restore the .bak
+# on_ready() deletes the marker; reaching it is what certifies a boot healthy.
+# Deliberately placed above `import aiohttp/discord/anthropic` and uses stdlib
+# only, so it still runs when the new file's own imports are what's broken.
+
+_UPDATE_MARKER = Path(__file__).resolve().with_name(".update_pending")
+
+
+def _rollback_if_update_failed() -> None:
+    try:
+        if not _UPDATE_MARKER.exists():
+            return
+        try:
+            state = json.loads(_UPDATE_MARKER.read_text() or "{}")
+        except Exception:
+            state = {}
+        attempts = int(state.get("attempts", 0) or 0)
+        me = Path(__file__).resolve()
+        backup = me.with_name(me.name + ".bak")
+
+        if attempts >= 1:
+            print(f"[rollback] the update to {me.name} never finished booting "
+                  f"(attempt {attempts}).")
+            if backup.is_file():
+                try:
+                    me.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
+                    _UPDATE_MARKER.unlink(missing_ok=True)
+                    print(f"[rollback] restored {backup.name} — re-execing into "
+                          "the previous working version.")
+                    os.execv(sys.executable, [sys.executable, *sys.argv])
+                except Exception as e:
+                    print(f"[rollback] restore FAILED: {type(e).__name__}: {e}")
+            else:
+                print(f"[rollback] no {backup.name} to restore from — "
+                      "fix the file manually.")
+            _UPDATE_MARKER.unlink(missing_ok=True)
+            return
+
+        state["attempts"] = attempts + 1
+        _UPDATE_MARKER.write_text(json.dumps(state))
+    except Exception as e:
+        # The guard must never be the thing that stops the bot booting.
+        print(f"[rollback] guard error (ignored): {type(e).__name__}: {e}")
+
+
+_rollback_if_update_failed()
+
 import aiohttp
 import discord
 from discord import app_commands
@@ -1611,6 +1666,12 @@ OWNER_IDS: set[int] = {
 
 @bot.event
 async def on_ready():
+    # Reaching on_ready means this build boots fine — disarm the crash-rollback
+    # guard so a later restart doesn't mistake it for a failed update.
+    try:
+        _UPDATE_MARKER.unlink(missing_ok=True)
+    except Exception:
+        pass
     load_config()
     load_memory()
     try:
@@ -4086,6 +4147,9 @@ async def _fetch_update(url: str) -> dict:
         backup = path.with_name(path.name + ".bak")
         backup.write_text(current, encoding="utf-8")
         path.write_text(content, encoding="utf-8")
+        # Arm the crash-rollback guard. If the boot into this new file never
+        # reaches on_ready, the next boot restores the .bak automatically.
+        _UPDATE_MARKER.write_text(json.dumps({"attempts": 0, "sha": result["sha"]}))
     except Exception as e:
         result["message"] = f"couldn't write the file: {type(e).__name__}: {e}"
         return result
