@@ -1,6 +1,6 @@
 # Discord AI Chatbot
 
-A Discord bot powered by Claude (`claude-sonnet-5-5` by default) with an unhinged, evil, devious personality. Responds to @mentions in servers and to all messages in DMs. Keeps per-channel conversation memory (last 50 turns, persisted across restarts).
+A Discord bot powered by Claude (`claude-sonnet-5-5` by default) with an unhinged, evil, devious personality. Responds to @mentions in servers and to all messages in DMs. Keeps per-channel conversation memory (last 50 turns plus a rolling summary of older ones, persisted across restarts), **long-term notes about people**, and can react, make polls, set reminders, read files and links, and play music.
 
 ## Setup
 
@@ -97,6 +97,9 @@ All optional — the defaults are tuned for a chat bot. Set them as environment 
 | `PROMPT_CACHE` | on | Prompt caching. The system prompt and earlier messages get re-read from cache at ~10% of the normal price instead of being billed in full on every message. `PROMPT_CACHE=0` turns it off |
 | `CLAUDE_FALLBACKS` | on (Claude 5 models) | If Claude's safety filters decline a message, the API retries it on another model automatically. `0` turns it off. When a message is still declined, the bot answers with a short in-character "not doing that" and forgets that message |
 | `ENABLE_WEB_SEARCH` | off | `1` lets the bot search the web for things that need fresh facts (news, scores, prices). Each search costs about $0.01 on top of tokens, so it's opt-in |
+| `ENABLE_WEB_FETCH` | on | Lets the bot open and read links people post (articles, docs, GitHub pages…). No per-use fee — the page text just counts as input tokens (capped at 20k per page). `0` turns it off |
+| `CONVO_SUMMARY` | on | When old messages scroll out of a conversation's memory, the bot first condenses them into a short summary it keeps (one cheap extra API call every ~15 turns). `0` turns it off |
+| `BOT_TIMEZONE` | `UTC` | Time zone the bot thinks in (IANA name like `Europe/Berlin`, `America/New_York`). Used for the date it sees, message timestamps, and reminders |
 
 Use `/usage` (owner only) to see token usage, the cache hit rate, and an estimated cost since the last restart.
 
@@ -106,6 +109,14 @@ Use `/usage` (owner only) to see token usage, the cache hit rate, and an estimat
 - **In DMs**: just message it directly — no mention needed
 - **Auto-reply channel**: run `/setup` in any channel to make the bot reply to every message there (no mention needed)
 - **Images (in)**: attach an image and the bot will see it (vision support). Images stay attached for the next few messages; after that only a "(sent an image)" note stays in memory (old images are expensive to re-send, and Discord's image links expire after about a day)
+- **Files (in)**: attach a text/code/log file (`.txt`, `.md`, `.py`, `.js`, `.json`, `.log`, `.csv`, … up to 200 KB) or a PDF and the bot reads it — "here's my error log, what's wrong?" just works
+- **Links (in)**: paste a URL and the bot can open and read the page (`ENABLE_WEB_FETCH`, on by default)
+- **Long-term memory**: the bot saves facts worth keeping about people and the server ("prefers to be called Ash", "has a cat named Mochi", "this is a Minecraft SMP") and knows them in every channel, forever, across restarts. It decides what to save itself (you can also tell it "remember that…" / "forget that"). `/memory` shows what it has on you and lets you wipe it. Sensitive stuff (health, politics, addresses, money) is off-limits by instruction
+- **Rolling summary**: a conversation only keeps the last 50 turns verbatim, but when older messages scroll out they're folded into a short summary the bot keeps for 2 weeks — so it still knows what you talked about an hour ago, or last week
+- **Context awareness**: the bot knows its own name in your server, which server/channel/thread it's in (and the channel topic / the message a thread started from), today's date, and the time each message was sent — so "what day is it", "who are you", "that was 3 hours ago" all work
+- **Reactions (out)**: the bot can react to your message with an emoji (standard or a custom server one) instead of, or in addition to, replying
+- **Polls (out)**: "make a poll: pizza or tacos?" → a native Discord poll, attached to its reply
+- **Reminders (out)**: "remind me in 20 minutes to check the oven" → it pings you in that channel 20 minutes later, in character. Survives restarts. `/reminders` lists and cancels yours
 - **GIFs (out)**: with `GIPHY_API_KEY` set, the bot can post reaction GIFs back via the `send_gif` tool (Claude picks the moment and the search query)
 - **Videos (out)**: with `YOUTUBE_API_KEY` set, the bot can search YouTube and post videos via the `send_video` tool — Discord auto-embeds the URL as an inline player
 - **Custom emojis (in & out)**: the bot reads custom server emojis users send and uses them inline in its own replies (`:emoji_name:` syntax — auto-rewritten to the rendered form before sending). Up to 40 emojis per server are exposed to Claude; if your server has more, only the alphabetically-first 40 are listed
@@ -137,6 +148,8 @@ Use `/usage` (owner only) to see token usage, the cache hit rate, and an estimat
 | `/rage`   | Show the current patience meter for this conversation (with bar + tier) |
 | `/status` | Show model, mood, memory, scope, active conversation count      |
 | `/tldr`   | Summarize the last 10-200 messages in this channel ("what did I miss"), in the current mood's voice. One per channel per minute |
+| `/memory` | Show the long-term notes the bot keeps about you (and about the server), with a button to wipe them. Manage Channels lets you look at other people's |
+| `/reminders` | List your pending reminders; `cancel:<number>` cancels one |
 | `/specs`  | Host hardware (CPU, container RAM, disk) + bot runtime stats (uptime, ping, servers) |
 | `/play`   | Join voice and queue a track **or playlist/album** from YouTube/SoundCloud/Spotify/Apple Music (URL or search) |
 | `/pause`  | Pause the current track                                         |
@@ -185,12 +198,22 @@ Per-conversation overrides win over server defaults. All settings persist to `ch
 - **`chill`** — Friendly, mildly sarcastic, swears sparingly.
 - **`tsundere`** — Cold and prickly on the surface, secretly invested. Pretends not to want to help, then helps thoroughly. Stutters when flustered. "B-baka!" energy. Never actually cruel — the bark is for show.
 
-Use `/status` to see the current patience meter for a conversation. `/reset` and `/purge` both wipe it.
+Use `/status` to see the current patience meter for a conversation. `/reset` and `/purge` both wipe it (along with the conversation's summary; long-term notes about people stay — use `/memory` for those).
+
+## Tests
+
+`tests/test_bot.py` runs the real Anthropic SDK against a local fake API and fake Discord objects — no keys, no network:
+
+```
+pip install -r requirements.txt
+python tests/test_bot.py
+```
 
 ## Customization
 
 Model, effort, caching and web search are environment variables (see **Claude settings** above). In `bot.py`:
 - `MOODS` / `escalating_prompt()` — change the bot's personalities
-- `MAX_TURNS` — how many turns of history to remember per channel (default 50; trimmed to ~35 in one go when it overflows, so prompt caching keeps working)
+- `MAX_TURNS` — how many turns of history to remember per channel (default 50; trimmed to ~35 in one go when it overflows, so prompt caching keeps working — the trimmed part is folded into the rolling summary)
+- `NOTES_PER_USER` / `NOTES_PER_SERVER` — how many long-term notes the bot keeps per person / per server (12 / 10)
 - `MAX_TOKENS` — max tokens per Claude response, thinking included (default 8000)
 - `TOKEN_BUDGET` — max prompt size per conversation before old turns are dropped (default 180,000)
