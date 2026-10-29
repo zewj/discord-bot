@@ -1,6 +1,6 @@
 # Discord AI Chatbot
 
-A Discord bot powered by Claude (claude-sonnet-4-6) with an unhinged, evil, devious personality. Responds to @mentions in servers and to all messages in DMs. Keeps per-channel conversation memory (last 20 turns).
+A Discord bot powered by Claude (`claude-sonnet-5-5` by default) with an unhinged, evil, devious personality. Responds to @mentions in servers and to all messages in DMs. Keeps per-channel conversation memory (last 50 turns, persisted across restarts).
 
 ## Setup
 
@@ -86,12 +86,26 @@ $env:SPOTIFY_CLIENT_SECRET = "your_spotify_client_secret"  # optional — Spotif
 python bot.py
 ```
 
+### 8. (Optional) Claude settings
+
+All optional — the defaults are tuned for a chat bot. Set them as environment variables like the keys above.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CLAUDE_MODEL` | `claude-sonnet-5-5` | Which Claude model to use. `claude-sonnet-4-6` puts the bot back on the old model. `claude-haiku-5-5` is much cheaper; `claude-opus-5-5` is smarter but costs 2x Sonnet |
+| `CLAUDE_EFFORT` | `low` on Claude 5 models | How hard the model thinks before replying: `low` / `medium` / `high` / `xhigh` / `max`. `low` keeps replies fast and cheap; raise it if answers to real questions feel shallow. `default` sends nothing |
+| `PROMPT_CACHE` | on | Prompt caching. The system prompt and earlier messages get re-read from cache at ~10% of the normal price instead of being billed in full on every message. `PROMPT_CACHE=0` turns it off |
+| `CLAUDE_FALLBACKS` | on (Claude 5 models) | If Claude's safety filters decline a message, the API retries it on another model automatically. `0` turns it off. When a message is still declined, the bot answers with a short in-character "not doing that" and forgets that message |
+| `ENABLE_WEB_SEARCH` | off | `1` lets the bot search the web for things that need fresh facts (news, scores, prices). Each search costs about $0.01 on top of tokens, so it's opt-in |
+
+Use `/usage` (owner only) to see token usage, the cache hit rate, and an estimated cost since the last restart.
+
 ## Usage
 
 - **In a server**: `@YourBot hello, what's up?`
 - **In DMs**: just message it directly — no mention needed
 - **Auto-reply channel**: run `/setup` in any channel to make the bot reply to every message there (no mention needed)
-- **Images (in)**: attach an image and the bot will see it (vision support)
+- **Images (in)**: attach an image and the bot will see it (vision support). Images stay attached for the next few messages; after that only a "(sent an image)" note stays in memory (old images are expensive to re-send, and Discord's image links expire after about a day)
 - **GIFs (out)**: with `GIPHY_API_KEY` set, the bot can post reaction GIFs back via the `send_gif` tool (Claude picks the moment and the search query)
 - **Videos (out)**: with `YOUTUBE_API_KEY` set, the bot can search YouTube and post videos via the `send_video` tool — Discord auto-embeds the URL as an inline player
 - **Custom emojis (in & out)**: the bot reads custom server emojis users send and uses them inline in its own replies (`:emoji_name:` syntax — auto-rewritten to the rendered form before sending). Up to 40 emojis per server are exposed to Claude; if your server has more, only the alphabetically-first 40 are listed
@@ -122,6 +136,7 @@ python bot.py
 | `/mood`   | Switch personality preset (`escalating` / `feral` / `villain` / `chill` / `tsundere`) — scope `server` or `here` |
 | `/rage`   | Show the current patience meter for this conversation (with bar + tier) |
 | `/status` | Show model, mood, memory, scope, active conversation count      |
+| `/tldr`   | Summarize the last 10-200 messages in this channel ("what did I miss"), in the current mood's voice. One per channel per minute |
 | `/specs`  | Host hardware (CPU, container RAM, disk) + bot runtime stats (uptime, ping, servers) |
 | `/play`   | Join voice and queue a track **or playlist/album** from YouTube/SoundCloud/Spotify/Apple Music (URL or search) |
 | `/pause`  | Pause the current track                                         |
@@ -146,7 +161,8 @@ python bot.py
 | `/autoplay` | Toggle autoplay (keep playing related songs when the queue ends); default on |
 | `/247`    | Toggle 24/7 mode (stay in the voice channel even when idle/empty); default on |
 | `/restart`| **Owner only.** Restart the bot in place (re-execs the process) |
-| `/update` | **Owner only.** `git pull origin main` then restart — pulls the latest code from GitHub |
+| `/usage`  | **Owner only.** Claude token usage, prompt-cache hit rate, and estimated cost since the last restart |
+| `/update` | **Owner only.** Download the latest `bot.py` from GitHub `main` and restart (see below) |
 
 ### Owner commands (`/restart`, `/update`)
 
@@ -163,7 +179,7 @@ Per-conversation overrides win over server defaults. All settings persist to `ch
 
 ### Moods
 
-- **`escalating`** *(default)* — Starts polite and helpful. Patience drains every turn (+1) and faster on dumb messages (short, all-caps, repeats, low-effort openers like "yo"/"bruh", begging like "plsss"). Decays ~1 point per 5 minutes idle. At low patience you get a warm helper, at mid you get sarcasm, at high you get the unhinged cussing menace. The bot doesn't mention the meter to users — just calibrates tone.
+- **`escalating`** *(default)* — Starts polite and helpful. Patience drains every turn (+0.5) and faster on dumb messages (short, all-caps, repeats, low-effort openers like "yo"/"bruh", begging like "plsss"). Decays ~1 point per 5 minutes idle. At low patience you get a warm helper, at mid you get sarcasm, at high you get the unhinged cussing menace. The bot doesn't mention the meter to users — just calibrates tone.
 - **`feral`** — Immediately unhinged, no warmup. The OG.
 - **`villain`** — Theatrical Saturday-morning supervillain.
 - **`chill`** — Friendly, mildly sarcastic, swears sparingly.
@@ -173,8 +189,8 @@ Use `/status` to see the current patience meter for a conversation. `/reset` and
 
 ## Customization
 
-Edit `bot.py`:
-- `MODEL` — currently `claude-sonnet-4-6` (balanced); switch to `claude-haiku-4-5` for cheapest/fastest or `claude-opus-4-7` for max intelligence
-- `SYSTEM_PROMPT` — change the bot's personality
-- `MAX_TURNS` — how many turns of history to remember per channel (default 50)
-- `MAX_TOKENS` — max length of each Claude response (default 2048)
+Model, effort, caching and web search are environment variables (see **Claude settings** above). In `bot.py`:
+- `MOODS` / `escalating_prompt()` — change the bot's personalities
+- `MAX_TURNS` — how many turns of history to remember per channel (default 50; trimmed to ~35 in one go when it overflows, so prompt caching keeps working)
+- `MAX_TOKENS` — max tokens per Claude response, thinking included (default 8000)
+- `TOKEN_BUDGET` — max prompt size per conversation before old turns are dropped (default 180,000)
