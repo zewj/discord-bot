@@ -1610,6 +1610,35 @@ def _build_tools(sticker_map: dict | None) -> list:
     return tools
 
 
+def _disable_rejected_option(err_text: str) -> bool:
+    """If a 400 names one of the optional request settings (refusal
+    fallbacks, effort, prompt caching), switch that setting off for the rest
+    of this run and return True so the caller retries without it.
+
+    Keeps the bot answering if, say, CLAUDE_MODEL points at a model that
+    doesn't take `effort`, or the account can't use the fallback beta —
+    instead of every single message failing until someone edits the env.
+    """
+    global USE_FALLBACKS, EFFORT, PROMPT_CACHE
+    t = err_text.lower()
+    if USE_FALLBACKS and "fallback" in t:
+        USE_FALLBACKS = False
+        print("[claude] API rejected refusal fallbacks — disabled them for this run "
+              "(set CLAUDE_FALLBACKS=0 to silence this)")
+        return True
+    if EFFORT and ("output_config" in t or "effort" in t):
+        print(f"[claude] API rejected effort={EFFORT!r} for {MODEL} — not sending "
+              "effort for this run (set CLAUDE_EFFORT=default to silence this)")
+        EFFORT = None
+        return True
+    if PROMPT_CACHE and "cache_control" in t:
+        PROMPT_CACHE = False
+        print("[claude] API rejected cache_control — prompt caching disabled for "
+              "this run (set PROMPT_CACHE=0 to silence this)")
+        return True
+    return False
+
+
 async def _create_message(
     messages: list,
     system: str,
@@ -1623,27 +1652,33 @@ async def _create_message(
     whatever (possibly old) `anthropic` package the host has installed —
     /update only replaces bot.py, never the installed packages.
     """
-    kwargs: dict = {
-        "model": MODEL,
-        "max_tokens": max_tokens,
-        "system": system,
-        "messages": messages,
-    }
-    if tools:
-        kwargs["tools"] = tools
-    extra_body: dict = {}
-    if PROMPT_CACHE and cache:
-        extra_body["cache_control"] = {"type": "ephemeral"}
-    if EFFORT:
-        extra_body["output_config"] = {"effort": EFFORT}
-    if USE_FALLBACKS:
-        extra_body["fallbacks"] = "default"
-    if extra_body:
-        kwargs["extra_body"] = extra_body
-    async with api_semaphore:
+    for _ in range(4):   # at most one retry per optional setting
+        kwargs: dict = {
+            "model": MODEL,
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": messages,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        extra_body: dict = {}
+        if PROMPT_CACHE and cache:
+            extra_body["cache_control"] = {"type": "ephemeral"}
+        if EFFORT:
+            extra_body["output_config"] = {"effort": EFFORT}
         if USE_FALLBACKS:
-            return await claude.beta.messages.create(betas=[FALLBACK_BETA], **kwargs)
-        return await claude.messages.create(**kwargs)
+            extra_body["fallbacks"] = "default"
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        try:
+            async with api_semaphore:
+                if USE_FALLBACKS:
+                    return await claude.beta.messages.create(betas=[FALLBACK_BETA], **kwargs)
+                return await claude.messages.create(**kwargs)
+        except anthropic.BadRequestError as e:
+            if not _disable_rejected_option(str(e)):
+                raise
+    raise RuntimeError("Claude request kept failing after disabling optional settings")
 
 
 def _record_usage(response) -> None:
