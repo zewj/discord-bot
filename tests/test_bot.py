@@ -265,7 +265,14 @@ async def main():
         check(bot.FALLBACK_BETA in r["headers"].get("anthropic-beta", ""), "fallback beta header sent")
     sysp = b["system"]
     check("37" not in sysp.split("ABOUT YOU")[0] and "'snarky'" in sysp, "rage tier (not number) in prompt")
-    check('Your Discord name here is "Botty"' in sysp, "bot knows its own name")
+    check('Here you go by "Botty"' in sysp, "bot knows its own name")
+    check("STAYING IN CHARACTER" in sysp and "Never describe yourself as a bot" in sysp,
+          "stay-in-character rule in prompt")
+    # The rule itself names the forbidden words, so scan everything but HARD_LIMITS.
+    low = sysp.replace(bot.HARD_LIMITS, "").lower()
+    check("chatbot" not in low and "claude" not in low and bot.MODEL not in sysp
+          and "anthropic" not in low and "assistant" not in low and "the bot" not in low,
+          "prompt never calls it a chatbot, an assistant or names the model")
     check('server "Test Server" (~42 members), in the channel #general' in sysp and "Where we talk" in sysp,
           "bot knows server/channel/topic")
     check("Today is Wednesday, 2026-10-29" in sysp or "Today is " in sysp, "date in prompt")
