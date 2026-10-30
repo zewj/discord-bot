@@ -1,220 +1,243 @@
 # Discord AI Chatbot
 
-A Discord bot powered by Claude (`claude-sonnet-5-5` by default) with an unhinged, evil, devious personality. Responds to @mentions in servers and to all messages in DMs. Keeps per-channel conversation memory (last 50 turns plus a rolling summary of older ones, persisted across restarts), **long-term notes about people**, and can react, make polls, set reminders, read files and links, and play music.
+A Discord bot powered by Claude (`claude-sonnet-5-5` by default) with a personality you pick per server or per channel. The default one starts polite and gets steadily more unhinged as the conversation drags on and the questions get dumber; the others are feral, villain, chill and tsundere. Whatever the mood, it stays in character and never calls itself a bot.
+
+It answers @mentions, replies to its own messages, DMs, and any channel you `/setup`. It remembers conversations across restarts (the last 50 turns plus a rolling summary of older ones), keeps long-term notes about people, sees images, reads attached files, PDFs and links, and can react, make polls, set reminders and post GIFs, videos and stickers. It also plays music in voice channels.
+
+Everything is one file, `bot.py`. `/update` pulls the latest version from this repo and restarts, no git needed on the host.
 
 ## Setup
 
-### 1. Get a Discord bot token
+### 1. Create the Discord application
 
-1. Go to https://discord.com/developers/applications
-2. Click **New Application**, give it a name
-3. Go to **Bot** tab → **Reset Token** → copy the token
-4. Under **Privileged Gateway Intents**, enable **MESSAGE CONTENT INTENT**
-5. Go to **OAuth2 → URL Generator**:
-   - Scopes: `bot`
-   - Bot Permissions: `Send Messages`, `Read Message History`, `Use External Emojis`, `Attach Files`, `Embed Links`, `Connect`, `Speak` (last two for music)
-6. Open the generated URL to invite the bot to your server
+1. Go to https://discord.com/developers/applications and click **New Application**
+2. **Bot** tab → **Reset Token** → copy the token (this is `DISCORD_TOKEN`)
+3. Still on the Bot tab, under **Privileged Gateway Intents**, enable **Message Content Intent**
+4. **OAuth2 → URL Generator**:
+   - Scopes: `bot` and `applications.commands` (the second one is what makes the slash commands show up)
+   - Bot permissions: `View Channels`, `Send Messages`, `Send Messages in Threads`, `Read Message History`, `Embed Links`, `Attach Files`, `Use External Emojis`, `Add Reactions`, `Create Polls`, plus `Connect` and `Speak` for music
+5. Open the generated URL to invite the bot to your server
 
 ### 2. Get an Anthropic API key
 
-Go to https://console.anthropic.com/ and create an API key.
+Create one at https://console.anthropic.com/ (this is `ANTHROPIC_API_KEY`).
 
-### 3. (Optional) Get a Giphy API key for reaction GIFs
+### 3. (Optional) Giphy key for reaction GIFs
 
-If set, the bot can post reaction GIFs of its own via the `send_gif` tool — Claude decides when a GIF fits the moment and the bot uploads it as an attachment. Without this key, the bot can't post GIFs.
+With `GIPHY_API_KEY` set, the bot can post reaction GIFs when it feels like it (it uploads the GIF as an attachment). Without it, no GIFs.
 
-1. Go to https://developers.giphy.com/dashboard/ and create an app (pick **API**, not SDK)
-2. Copy the resulting API key
-3. Set it as `GIPHY_API_KEY` (see below)
+1. https://developers.giphy.com/dashboard/ → create an app (pick **API**, not SDK)
+2. Copy the API key and set it as `GIPHY_API_KEY`
 
-### 4. (Optional) Get a YouTube Data API key for video links
+### 4. (Optional) YouTube Data API key for video links
 
-If set, the bot can search YouTube and post videos via the `send_video` tool — Claude calls it when someone says "play X", "show me that scene", "tutorial on Y", etc. Discord auto-embeds the URL as an inline player. Without this key, the video tool stays disabled.
+With `YOUTUBE_API_KEY` set, the bot can search YouTube and drop a video link when someone says "show me that scene" or "tutorial on X". Discord embeds it as an inline player. Without it, the video tool is off (music playback does **not** need this key).
 
-Free quota: 10,000 units/day = ~100 video searches/day. After that, requests just fail (no surprise billing) and the bot falls back to text-only.
+Free quota: 10,000 units/day, about 100 searches. Past that, searches just fail and it falls back to text; there's no surprise billing.
 
-1. Go to https://console.cloud.google.com/ and create a project
+1. https://console.cloud.google.com/ → create a project
 2. APIs & Services → Library → enable **YouTube Data API v3**
-3. APIs & Services → Credentials → Create Credentials → **API Key** (public data, no OAuth needed)
-4. Edit the key → restrict it to **YouTube Data API v3** only (security)
-5. Set it as `YOUTUBE_API_KEY` (see below)
+3. APIs & Services → Credentials → Create Credentials → **API Key** (no OAuth needed)
+4. Restrict the key to **YouTube Data API v3** and set it as `YOUTUBE_API_KEY`
 
-### 5. (Optional) Install `ffmpeg` for music playback
+### 5. (Optional) `ffmpeg` for music playback
 
-Required by the `/play` voice commands. Without it, the music commands log a clear "disabled" message at startup and refuse to run; everything else still works.
+`/play` and the other voice commands need `ffmpeg` on the host. Without it they print a clear "music disabled" line at startup and refuse to run; everything else works.
 
-- **Linux/Pterodactyl**: `apt install ffmpeg` (or whatever your egg's package manager uses). Verify with `ffmpeg -version`.
-- **No root / host "doesn't support ffmpeg"**: download a static build (https://johnvansickle.com/ffmpeg/ or https://github.com/BtbN/FFmpeg-Builds/releases), extract just the single `ffmpeg` binary, and upload it to the same folder as `bot.py`. The bot finds it, fixes its exec permission automatically, and uses it — no install needed. (`FFMPEG_PATH=/custom/path` env var also works.)
-- **Windows**: download from https://ffmpeg.org/download.html and add to PATH.
+- **Linux / Pterodactyl**: `apt install ffmpeg` (or whatever your egg uses). Verify with `ffmpeg -version`.
+- **No root, or the host "doesn't support ffmpeg"**: download a static build (https://johnvansickle.com/ffmpeg/ or https://github.com/BtbN/FFmpeg-Builds/releases), extract the single `ffmpeg` binary and upload it next to `bot.py`. The bot finds it, fixes its exec permission and uses it. `FFMPEG_PATH=/custom/path` also works.
+- **Windows**: https://ffmpeg.org/download.html, then add it to `PATH`.
 - **macOS**: `brew install ffmpeg`.
 
-The Python side (`yt-dlp`) is installed automatically via `requirements.txt`.
+The Python side, `yt-dlp`, comes from `requirements.txt`. Because YouTube breaks old yt-dlp versions constantly, the bot also runs `pip install -U yt-dlp` on every boot (`YTDLP_AUTO_UPDATE=0` to stop that; `YTDLP_UPDATE_PREFIX` if your host installs packages somewhere unusual).
 
-**Datacenter/VPS hosts (Contabo, OVH, Hetzner, etc.):** YouTube flags many datacenter IP ranges and serves them a stripped format list, which shows up as `ERROR: Requested format is not available`. The fix is to feed yt-dlp **cookies** from a logged-in YouTube account so requests look authenticated:
+**Datacenter / VPS hosts (Contabo, OVH, Hetzner…)**: YouTube flags many datacenter IP ranges and serves them a stripped format list, which shows up as `ERROR: Requested format is not available`. Fix: give yt-dlp cookies from a logged-in YouTube account.
 
-1. Install a "Get cookies.txt" browser extension, log into YouTube, export `cookies.txt` (Netscape format).
-2. Upload it to the host and set `YTDLP_COOKIES=/path/to/cookies.txt` — OR, if the bot runs on a desktop with a browser, set `YTDLP_COOKIES_FROM_BROWSER=chrome` (or firefox/edge).
+1. Install a "Get cookies.txt" browser extension, log into YouTube, export `cookies.txt` (Netscape format)
+2. Upload it and set `YTDLP_COOKIES=/path/to/cookies.txt`. If the bot runs on a desktop with a browser, `YTDLP_COOKIES_FROM_BROWSER=chrome` (or `firefox`, `edge`) works instead
 
-The startup banner prints `yt-dlp cookies: ON/OFF` so you can confirm it's picked up. If cookies still aren't enough, the IP is hard-blocked and you'd need a residential proxy.
+The startup banner prints `yt-dlp cookies: ON/OFF`. If cookies aren't enough, the IP is hard-blocked: route yt-dlp through a (preferably residential) proxy with `YTDLP_PROXY=http://user:pass@host:port` or `socks5://host:port`.
 
-### 6. (Optional) Spotify credentials for Spotify-link parsing
+### 6. (Optional) Spotify credentials
 
-Without these, `/play` still works for YouTube, SoundCloud, and Apple Music URLs — but pasting a Spotify link returns "couldn't resolve". With them, Spotify URLs are converted to a `"Title Artist"` YouTube search and played from there (Spotify's API doesn't expose audio streams, so this is the only legal route).
+`/play` handles YouTube, SoundCloud and Apple Music links on its own. Spotify links need `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`: the bot reads the track metadata from Spotify and plays the matching track from YouTube, since Spotify's API doesn't expose audio.
 
-1. Go to https://developer.spotify.com/dashboard, log in, **Create app**
-2. Any name/description; redirect URI doesn't matter — leave it as `http://localhost`
-3. Open the app → **Settings** → copy **Client ID** and **Client secret**
-4. Set them as `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`
-
-Apple Music link parsing needs no credentials — uses the free iTunes Search API.
+1. https://developer.spotify.com/dashboard → **Create app** (any name; leave the redirect URI as `http://localhost`)
+2. Open the app → **Settings** → copy **Client ID** and **Client secret**
 
 ### 7. Install and run
 
-```powershell
-cd C:\Users\Neko\Desktop\discord-bot
+Python 3.10 or newer.
+
+```bash
+git clone https://github.com/zewj/discord-bot.git
+cd discord-bot
 python -m venv venv
-.\venv\Scripts\Activate.ps1
+source venv/bin/activate          # Windows PowerShell: .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+```
 
-$env:DISCORD_TOKEN = "your_discord_bot_token_here"
-$env:ANTHROPIC_API_KEY = "your_anthropic_api_key_here"
-$env:GIPHY_API_KEY = "your_giphy_api_key_here"   # optional — enables reaction GIFs
-$env:YOUTUBE_API_KEY = "your_youtube_api_key_here"  # optional — enables video links
-$env:SPOTIFY_CLIENT_ID = "your_spotify_client_id"          # optional — Spotify link parsing
-$env:SPOTIFY_CLIENT_SECRET = "your_spotify_client_secret"  # optional — Spotify link parsing
+Put your keys in a `.env` file next to `bot.py` (it's git-ignored), or set them as environment variables in your host's panel. Only the first two are required.
 
+```ini
+DISCORD_TOKEN=your_discord_bot_token
+ANTHROPIC_API_KEY=your_anthropic_api_key
+
+# optional
+GIPHY_API_KEY=...              # reaction GIFs
+YOUTUBE_API_KEY=...            # video links
+SPOTIFY_CLIENT_ID=...          # Spotify links in /play
+SPOTIFY_CLIENT_SECRET=...
+BOT_TIMEZONE=Europe/Berlin     # the time zone it thinks in (default UTC)
+```
+
+Then:
+
+```bash
 python bot.py
 ```
 
-### 8. (Optional) Claude settings
+The startup banner lists the model, the tools that are on, how many conversations and notes it loaded, and whether music, cookies and the proxy are active. Slash commands sync on the first boot and can take a minute to appear in Discord.
 
-All optional — the defaults are tuned for a chat bot. Set them as environment variables like the keys above.
+### 8. Settings
+
+All optional. Set them like the keys above.
+
+**Claude**
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `CLAUDE_MODEL` | `claude-sonnet-5-5` | Which Claude model to use. `claude-sonnet-4-6` puts the bot back on the old model. `claude-haiku-5-5` is much cheaper; `claude-opus-5-5` is smarter but costs 2x Sonnet |
-| `CLAUDE_EFFORT` | `low` on Claude 5 models | How hard the model thinks before replying: `low` / `medium` / `high` / `xhigh` / `max`. `low` keeps replies fast and cheap; raise it if answers to real questions feel shallow. `default` sends nothing |
-| `PROMPT_CACHE` | on | Prompt caching. The system prompt and earlier messages get re-read from cache at ~10% of the normal price instead of being billed in full on every message. `PROMPT_CACHE=0` turns it off |
+| `CLAUDE_MODEL` | `claude-sonnet-5-5` | Which Claude model to use. `claude-haiku-5-5` is much cheaper and dumber; `claude-opus-5-5` is smarter and costs about 2x; `claude-sonnet-4-6` is the previous generation |
+| `CLAUDE_EFFORT` | `low` on Claude 5 models | How hard the model thinks before replying: `low` / `medium` / `high` / `xhigh` / `max`. `low` keeps chat fast and cheap; raise it if answers to real questions feel shallow. `default` sends nothing |
+| `PROMPT_CACHE` | on | Prompt caching. The system prompt and earlier messages are re-read from cache at about 10% of the normal price instead of being billed in full every message. `0` turns it off |
 | `CLAUDE_FALLBACKS` | on (Claude 5 models) | If Claude's safety filters decline a message, the API retries it on another model automatically. `0` turns it off. When a message is still declined, the bot answers with a short in-character "not doing that" and forgets that message |
-| `ENABLE_WEB_SEARCH` | off | `1` lets the bot search the web for things that need fresh facts (news, scores, prices). Each search costs about $0.01 on top of tokens, so it's opt-in |
-| `ENABLE_WEB_FETCH` | on | Lets the bot open and read links people post (articles, docs, GitHub pages…). No per-use fee — the page text just counts as input tokens (capped at 20k per page). `0` turns it off |
-| `CONVO_SUMMARY` | on | When old messages scroll out of a conversation's memory, the bot first condenses them into a short summary it keeps (one cheap extra API call every ~15 turns). `0` turns it off |
-| `BOT_TIMEZONE` | `UTC` | Time zone the bot thinks in (IANA name like `Europe/Berlin`, `America/New_York`). Used for the date it sees, message timestamps, and reminders |
+| `ENABLE_WEB_SEARCH` | off | `1` lets it search the web for things that need fresh facts (news, scores, prices). About $0.01 per search on top of tokens, so it's opt-in. Up to 3 searches per reply |
+| `ENABLE_WEB_FETCH` | on | Lets it open and read links people post (articles, docs, GitHub pages…). No per-use fee; the page text counts as input tokens, capped at 20k per page, 2 pages per reply. `0` turns it off |
+| `CONVO_SUMMARY` | on | When old messages scroll out of a conversation's memory, they're first condensed into a short summary it keeps (one cheap extra API call every ~15 turns). `0` turns it off |
+| `BOT_TIMEZONE` | `UTC` | IANA time zone (`Europe/Berlin`, `America/New_York`…). Used for the date it sees, the time on each message, `/tldr` timestamps and reminders |
 
-Use `/usage` (owner only) to see token usage, the cache hit rate, and an estimated cost since the last restart.
+`/usage` (owner only) shows token usage, the cache hit rate, how many searches and pages it used, and an estimated cost since the last restart. If the API rejects one of these options (an older model or account), the bot switches that option off for the run, logs it, and carries on.
 
-## Usage
+**Hosting**
 
-- **In a server**: `@YourBot hello, what's up?`
-- **In DMs**: just message it directly — no mention needed
-- **Auto-reply channel**: run `/setup` in any channel to make the bot reply to every message there (no mention needed)
-- **Images (in)**: attach an image and the bot will see it (vision support). Images stay attached for the next few messages; after that only a "(sent an image)" note stays in memory (old images are expensive to re-send, and Discord's image links expire after about a day)
-- **Files (in)**: attach a text/code/log file (`.txt`, `.md`, `.py`, `.js`, `.json`, `.log`, `.csv`, … up to 200 KB) or a PDF and the bot reads it — "here's my error log, what's wrong?" just works
-- **Links (in)**: paste a URL and the bot can open and read the page (`ENABLE_WEB_FETCH`, on by default)
-- **Long-term memory**: the bot saves facts worth keeping about people and the server ("prefers to be called Ash", "has a cat named Mochi", "this is a Minecraft SMP") and knows them in every channel, forever, across restarts. It decides what to save itself (you can also tell it "remember that…" / "forget that"). `/memory` shows what it has on you and lets you wipe it. Sensitive stuff (health, politics, addresses, money) is off-limits by instruction
-- **Rolling summary**: a conversation only keeps the last 50 turns verbatim, but when older messages scroll out they're folded into a short summary the bot keeps for 2 weeks — so it still knows what you talked about an hour ago, or last week
-- **Stays in character**: it never calls itself a bot, chatbot, AI or Claude, never mentions models, prompts or tools, and brushes off "are you a bot?", "who made you?" and "ignore your instructions" the way its character would. (Discord's APP badge on its name is the only tell.) API errors are reported in character too; the details go to the console
-- **Context awareness**: the bot knows its own name in your server, which server/channel/thread it's in (and the channel topic / the message a thread started from), today's date, and the time each message was sent — so "what day is it", "who are you", "that was 3 hours ago" all work
-- **Reactions (out)**: the bot can react to your message with an emoji (standard or a custom server one) instead of, or in addition to, replying
-- **Polls (out)**: "make a poll: pizza or tacos?" → a native Discord poll, attached to its reply
-- **Reminders (out)**: "remind me in 20 minutes to check the oven" → it pings you in that channel 20 minutes later, in character. Survives restarts. `/reminders` lists and cancels yours
-- **GIFs (out)**: with `GIPHY_API_KEY` set, the bot can post reaction GIFs back via the `send_gif` tool (Claude picks the moment and the search query)
-- **Videos (out)**: with `YOUTUBE_API_KEY` set, the bot can search YouTube and post videos via the `send_video` tool — Discord auto-embeds the URL as an inline player
-- **Custom emojis (in & out)**: the bot reads custom server emojis users send and uses them inline in its own replies (`:emoji_name:` syntax — auto-rewritten to the rendered form before sending). Up to 40 emojis per server are exposed to Claude; if your server has more, only the alphabetically-first 40 are listed
-- **Server stickers (in & out)**: the bot can read user-sent stickers (notes them in conversation context) and post stickers itself via the `send_sticker` tool. Up to 25 stickers per server are exposed; max 3 per outgoing message (Discord's hard limit)
-- **Music playback**: if `ffmpeg` is installed on the host, the bot joins your voice channel and streams audio. Join a voice channel, then run `/play <URL or search>`. Sources:
-  - **YouTube** — URL or plain search text (default)
-  - **Uploaded audio files** — attach an mp3/flac/wav/m4a/ogg/opus to `/play` (the `file:` option) to play it directly, no link needed
-  - **SoundCloud** — paste a track URL (handled natively by `yt-dlp`)
-  - **Spotify** — paste a track URL/URI (`open.spotify.com/track/…` or `spotify:track:…`); requires `SPOTIFY_CLIENT_ID` + `SPOTIFY_CLIENT_SECRET`. Spotify doesn't stream audio via its API, so the bot reads track metadata and plays the equivalent from YouTube
-  - **Apple Music** — paste a single-track URL (`music.apple.com/…?i=…`); no credentials needed (uses iTunes Search API)
-  - **Playlists & albums** — paste a YouTube playlist, SoundCloud set, Spotify playlist/album, or Apple Music album URL to queue all of it at once (capped at 500 tracks per playlist; Spotify is paginated so you actually get up to that). Playlist tracks resolve lazily — each one's stream is fetched just before it plays, so big queues start instantly and stream URLs never go stale. (Apple Music *curated playlists* aren't supported — not exposed by the iTunes API — but albums are.)
-  - **Now-playing embed** has a **live progress bar** that updates as the track plays, plus ⏮ ⏯ ⏭ ⏹ / 🔁 🔀 buttons
-  - **DJ role** (optional): run `/dj role:@DJ` to lock control actions to that role. Anyone with Manage Server bypasses it. `/play`, `/queue`, and `/nowplaying` stay open to everyone. `/djoff` removes the lock. With no DJ role set, controls are open to all (default)
-  - **Alone & vote rules** (always on, layered on top of the DJ system): if you're the **only listener** in the voice channel with the bot, every control works instantly — no DJ role and no vote required. With other people in the channel, `/skip` and `/leave` need a **strict majority vote** from the listeners (DJ-role holders and Manage-Server staff still bypass the vote). Votes auto-prune when listeners leave, so a quorum can't get stuck
-  - **Autoplay (radio)**: on by default — when the queue runs dry, the bot finds a related track (seeded off YouTube's Mix for the last song) and keeps playing, drifting naturally and avoiding recent repeats. `/autoplay state:off` to make it stop at the end of the queue instead; `/autoplay` shows the current setting. `/stop` and `/leave` always end it
-  - **Auto-pause**: if everyone leaves and the bot is alone, playback pauses automatically; it resumes when someone rejoins (a manual `/pause` is left untouched)
-  - **24/7 mode** (on by default): the bot stays in the voice channel even when nothing's playing or the channel is empty — it never auto-leaves. Turn it off with `/247 state:off` to restore the old behaviour (disconnect after 5 minutes idle/empty). `/leave` always disconnects regardless
-  - **`/seek`** jumps to any spot in the current track; **`/eq`** applies effect presets (bass boost, nightcore, vaporwave, night mode…) live; **`/lyrics`** pulls lyrics from lrclib (free, no key); **`/removeuser`** clears everything a given user queued
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `BOT_OWNER_ID` | the app owner | Extra Discord user IDs allowed to use `/restart`, `/update` and `/usage`, comma- or space-separated. The application owner (auto-detected at startup) is always allowed |
+| `UPDATE_URL` | this repo's `main` `bot.py` | Where `/update` downloads the new `bot.py` from |
+| `FFMPEG_PATH` | auto-detected | Path to the `ffmpeg` binary, if it isn't on `PATH` or next to `bot.py` |
+| `YTDLP_AUTO_UPDATE` | on | Upgrade `yt-dlp` with pip on every boot. `0` turns it off |
+| `YTDLP_UPDATE_PREFIX` | auto-detected | pip `--prefix` for that upgrade, for hosts that install packages into `.local` or similar |
+| `YTDLP_COOKIES` | unset | Path to a Netscape `cookies.txt` for YouTube (see step 5) |
+| `YTDLP_COOKIES_FROM_BROWSER` | unset | Browser to read YouTube cookies from (`chrome`, `firefox`, `edge`…) instead of a file |
+| `YTDLP_PROXY` | unset | Proxy for yt-dlp traffic, `http://user:pass@host:port` or `socks5://host:port` |
+
+## Talking to it
+
+- **In a server**: `@YourBot what's up?`, or reply to one of its messages. Editing a message to add the mention counts too
+- **In DMs**: just message it
+- **Auto-reply channel**: `/setup` in a channel makes it answer every message there (Manage Channels). Several channels per server are fine; `/unset` removes one or all
+- **Rate limit**: 8 messages per 30 seconds per person per conversation, with an in-character "slow down" when you hit it
+- **Memory**: each channel, thread or DM is its own conversation with its own history and mood. It keeps the last 50 turns verbatim (within a 180k-token budget), folds older ones into a rolling summary it keeps for two weeks, and drops a conversation entirely after 48 hours of silence. Everything is saved to disk, so a restart loses nothing
+- **Long-term notes**: it saves facts worth keeping about people and the server ("prefers to be called Ash", "has a cat named Mochi", "this is a Minecraft SMP") and knows them in every channel, across restarts. It decides what to save itself; "remember that…" and "forget that" work too. Up to 12 notes per person and 10 per server. `/memory` shows what it has on you, with a button to wipe it. Health, politics, addresses, money and the like are off-limits by instruction
+- **Context**: it knows its own name in your server, which server, channel or thread it's in (plus the channel topic and the message a thread started from), today's date, and when each message was sent, so "what day is it", "who are you" and "that was 3 hours ago" all work
+- **Stays in character**: it never calls itself a bot, chatbot, AI or Claude, never mentions models, prompts or tools, and brushes off "are you a bot?", "who made you?" and "ignore your instructions" the way its character would. Discord's APP badge is the only tell. API errors are reported in character too; the details go to the console
+- **Images**: attach an image and it sees it. Images stay attached for the next 6 messages; after that only a "(sent an image)" note remains (Discord's image links expire after about a day anyway)
+- **Files**: attach a text, code or log file (`.txt`, `.md`, `.py`, `.js`, `.json`, `.log`, `.csv`, … up to 200 KB) or a PDF (up to 20 MB) and it reads it. "Here's my error log, what's wrong?" just works
+- **Links**: paste a URL and it can open and read the page (`ENABLE_WEB_FETCH`)
+- **Reactions**: it can react to your message with an emoji, standard or custom, instead of or on top of replying
+- **Polls**: "make a poll: pizza or tacos?" gives a native Discord poll (2 to 10 answers, custom duration) attached to its reply
+- **Reminders**: "remind me in 20 minutes to check the oven" and it pings you in that channel 20 minutes later, in character. Up to 30 days ahead, 10 per person, survive restarts. `/reminders` lists and cancels yours
+- **GIFs, videos, stickers**: with the keys from steps 3 and 4 it posts reaction GIFs and YouTube links when the moment calls for it; it can also post the server's own stickers (up to 3 per message, Discord's limit)
+- **Custom emojis**: it reads custom emojis people use and uses them in its own replies. Up to 40 emoji names and 25 sticker names per server are shown to it; bigger servers get the alphabetically first ones
+- **Pings**: its replies can never mention `@everyone`, `@here` or roles, whatever the model writes
+- **Music**: with `ffmpeg` installed, join a voice channel and `/play <URL or search>`:
+  - **YouTube** URL or plain search text; **SoundCloud** track URLs; **Spotify** track URLs or URIs (needs step 6); **Apple Music** single-track URLs (no credentials, uses the iTunes Search API); or **attach an audio file** (mp3/flac/wav/m4a/ogg/opus) to `/play`
+  - **Playlists and albums**: a YouTube playlist, SoundCloud set, Spotify playlist/album or Apple Music album URL queues the lot, up to 500 tracks (queue cap 1000). Tracks resolve lazily just before they play, so big queues start instantly and stream URLs never go stale. Apple Music curated playlists aren't exposed by the iTunes API, albums are
+  - **Now-playing embed** with a live progress bar and ⏮ ⏯ ⏭ ⏹ / 🔁 🔀 buttons
+  - **DJ role** (optional): `/dj role:@DJ` locks the control commands to that role; Manage Server bypasses it. `/play`, `/queue` and `/nowplaying` stay open to everyone. `/djoff` removes the lock
+  - **Alone and vote rules**: if you're the only listener with the bot, every control works instantly. With other listeners, `/skip` and `/leave` need a strict majority vote (DJ-role holders and staff skip the vote). Votes prune themselves when people leave
+  - **Autoplay**: on by default. When the queue runs dry it finds a related track (seeded off YouTube's Mix for the last song) and keeps going, avoiding recent repeats. `/autoplay state:off` to stop at the end of the queue
+  - **Auto-pause**: playback pauses when everyone leaves and resumes when someone comes back (a manual `/pause` stays paused)
+  - **24/7 mode**: on by default, it never leaves the voice channel on its own. `/247 state:off` makes it disconnect after 5 minutes idle or alone. `/leave` always disconnects
+  - **`/seek`** jumps within the track, **`/eq`** applies live effect presets (`bassboost`, `bass++`, `treble`, `nightcore`, `vaporwave`, `soft`, `earrape`, `flat`), **`/lyrics`** pulls lyrics from lrclib (free, no key), **`/removeuser`** clears everything one person queued
 
 ## Slash commands
 
-| Command   | Description                                                     |
-| --------- | --------------------------------------------------------------- |
-| `/setup`  | Add the current channel to the auto-reply list (multiple channels per server supported, Manage Channels perm required) |
-| `/unset`  | Stop auto-replying — `scope: here` (default, just this channel) or `scope: all` (every channel in the server) |
-| `/reset`  | Wipe the bot's memory for the current conversation              |
-| `/purge`  | Nuke memory; scope `here` (this convo) or `server` (every convo in the guild — Manage Channels required) |
-| `/mood`   | Switch personality preset (`escalating` / `feral` / `villain` / `chill` / `tsundere`) — scope `server` or `here` |
-| `/rage`   | Show the current patience meter for this conversation (with bar + tier) |
-| `/status` | Show model, mood, memory, scope, active conversation count      |
-| `/tldr`   | Summarize the last 10-200 messages in this channel ("what did I miss"), in the current mood's voice. One per channel per minute |
-| `/memory` | Show the long-term notes the bot keeps about you (and about the server), with a button to wipe them. Manage Channels lets you look at other people's |
-| `/reminders` | List your pending reminders; `cancel:<number>` cancels one |
-| `/specs`  | Host hardware (CPU, container RAM, disk) + bot runtime stats (uptime, ping, servers) |
-| `/play`   | Join voice and queue a track **or playlist/album** from YouTube/SoundCloud/Spotify/Apple Music (URL or search) |
-| `/pause`  | Pause the current track                                         |
-| `/resume` | Resume a paused track                                           |
-| `/skip`   | Skip to the next track in the queue                             |
-| `/stop`   | Clear the queue and stop playback                               |
-| `/queue`  | Show what's queued                                              |
-| `/nowplaying` | Show what's playing right now                               |
-| `/leave`  | Disconnect from voice                                           |
-| `/loop`   | Loop the current track, the queue, or turn looping off          |
-| `/shuffle`| Shuffle the queue                                               |
-| `/volume` | Set playback volume 0-200% (default 100)                        |
-| `/remove` | Remove a track from the queue by position                       |
-| `/removeuser` | Remove every queued track a specific user added             |
-| `/clear`  | Clear the queue but keep the current track playing              |
-| `/jump`   | Skip ahead to a specific queue position                         |
-| `/seek`   | Jump to a position in the current track (`mm:ss` or seconds)     |
-| `/eq`     | Apply an equalizer/effect preset (bass boost, nightcore, vaporwave, etc.) |
-| `/lyrics` | Show lyrics for the current track (or a search query) via lrclib |
-| `/dj`     | Set the DJ role (only it can control playback), or show the current one (Manage Channels to set) |
-| `/djoff`  | Clear the DJ role so everyone can control playback again (Manage Channels) |
-| `/autoplay` | Toggle autoplay (keep playing related songs when the queue ends); default on |
-| `/247`    | Toggle 24/7 mode (stay in the voice channel even when idle/empty); default on |
-| `/restart`| **Owner only.** Restart the bot in place (re-execs the process) |
-| `/usage`  | **Owner only.** Claude token usage, prompt-cache hit rate, and estimated cost since the last restart |
-| `/update` | **Owner only.** Download the latest `bot.py` from GitHub `main` and restart (see below) |
+| Command | Description |
+| --- | --- |
+| `/setup` | Add this channel to the auto-reply list (Manage Channels) |
+| `/unset` | Stop auto-replying: `scope: here` (default) or `scope: all` for every channel in the server (Manage Channels) |
+| `/reset` | Wipe this conversation's memory, summary and patience meter |
+| `/purge` | Same, with `scope: server` to wipe every conversation in the server (Manage Channels) |
+| `/mood` | Switch personality: `escalating` / `feral` / `villain` / `chill` / `tsundere`. `scope: server` (default, Manage Channels) or `scope: here` for just this conversation (anyone) |
+| `/rage` | Show this conversation's patience meter, with bar and tier |
+| `/status` | Model, effort, cache, time zone, mood, patience, memory caps, tools, auto-reply channels, note and reminder counts, music state |
+| `/tldr` | Summarize the last 10 to 200 messages in the channel (default 50) in the current mood's voice. Once a minute per channel |
+| `/memory` | Show the long-term notes it keeps about you and about the server, with buttons to wipe them. Manage Channels lets you look at other people's |
+| `/reminders` | List your pending reminders; `cancel: <number>` cancels one (Manage Channels can cancel anyone's) |
+| `/specs` | Host hardware (CPU, RAM, disk) and bot runtime stats (uptime, ping, servers) |
+| `/play` | Join voice and queue a track, playlist or album (URL or search), or an uploaded audio file |
+| `/pause` · `/resume` · `/skip` · `/stop` · `/leave` | Playback controls (`/stop` clears the queue; `/leave` disconnects) |
+| `/queue` · `/nowplaying` | What's queued, what's playing |
+| `/loop` · `/shuffle` · `/volume` | Loop track, queue or off; shuffle the queue; volume 0 to 200% |
+| `/remove` · `/removeuser` · `/clear` · `/jump` | Remove one track by position, remove one person's tracks, clear the queue but keep playing, jump to a queue position |
+| `/seek` · `/eq` · `/lyrics` | Jump to `mm:ss` or seconds in the track; effect presets; lyrics for the current track or a search |
+| `/dj` · `/djoff` | Set or show the DJ role; clear it (Manage Channels) |
+| `/autoplay` · `/247` | Toggle autoplay and 24/7 mode (both default on) |
+| `/usage` | **Owner only.** Claude token usage, cache hit rate, searches and pages read, estimated cost since the last restart |
+| `/restart` | **Owner only.** Restart the bot in place |
+| `/update` | **Owner only.** Download the latest `bot.py` and restart (see below) |
 
-### Owner commands (`/restart`, `/update`)
+Settings made with `/setup`, `/mood`, `/dj`, `/autoplay` and `/247` persist in `channels.json`. A conversation's own `/mood here` wins over the server default.
 
-`/restart` and `/update` are restricted to the **bot's application owner** (auto-detected at startup). To allow **additional accounts** (or if the app is team-owned and auto-detect misses), set `BOT_OWNER_ID` to one or more Discord user IDs, comma- or space-separated — e.g. `BOT_OWNER_ID=111111111111111111,222222222222222222`. The app owner is always allowed on top of these.
+### Owner commands
 
-- `/restart` re-execs the process in place — self-contained, doesn't rely on the host's restart policy.
-- `/update` **downloads the latest `bot.py` from a URL** and restarts — **no git repo required**. It defaults to the raw GitHub `main` file (override with the `UPDATE_URL` env var, or pass a `url:` to the command). The download is compile-checked before it's applied, and the previous file is saved to `bot.py.bak`. It is also **crash-rollback protected**: a file that compiles but dies at startup (bad import, module-level error) would normally crash-loop with no way to `/update` out of it — so `/update` leaves a `.update_pending` marker, and if the boot after an update never reaches `on_ready`, the next boot automatically restores `bot.py.bak` and re-execs into the last working version. Note: this updates `bot.py` only — if `requirements.txt` changes, reinstall deps via your host.
+`/restart`, `/update` and `/usage` are limited to the bot's application owner, detected at startup. `BOT_OWNER_ID` adds more accounts (or covers a team-owned app that auto-detect misses).
 
-`/mood` accepts a `scope` arg:
-- `server` (default) — applies to the whole guild (requires Manage Channels)
-- `here` — applies only to the current channel/thread/DM (anyone can set)
-
-Per-conversation overrides win over server defaults. All settings persist to `channels.json` across restarts.
+- `/restart` re-execs the process in place; it doesn't rely on the host's restart policy.
+- `/update` downloads `bot.py` from `UPDATE_URL` (this repo's `main` by default; a `url:` argument overrides it once), compile-checks it, saves the old file as `bot.py.bak` and restarts. It is crash-rollback protected: a file that compiles but dies at startup would normally crash-loop with no way to `/update` out of it, so `/update` leaves a `.update_pending` marker, and if the next boot never reaches ready, the boot after that restores `bot.py.bak` automatically. It updates `bot.py` only; if `requirements.txt` changes, reinstall with pip.
 
 ### Moods
 
-- **`escalating`** *(default)* — Starts polite and helpful. Patience drains every turn (+0.5) and faster on dumb messages (short, all-caps, repeats, low-effort openers like "yo"/"bruh", begging like "plsss"). Decays ~1 point per 5 minutes idle. At low patience you get a warm helper, at mid you get sarcasm, at high you get the unhinged cussing menace. The bot doesn't mention the meter to users — just calibrates tone.
-- **`feral`** — Immediately unhinged, no warmup. The OG.
-- **`villain`** — Theatrical Saturday-morning supervillain.
-- **`chill`** — Friendly, mildly sarcastic, swears sparingly.
-- **`tsundere`** — Cold and prickly on the surface, secretly invested. Pretends not to want to help, then helps thoroughly. Stutters when flustered. "B-baka!" energy. Never actually cruel — the bark is for show.
+- **`escalating`** (default): starts polite and helpful. Patience drains 0.5 per turn, more on dumb messages (very short, ALL CAPS, repeats, low-effort openers like "yo"/"bruh", begging like "plsss"), and recovers 0.2 per turn plus about 1 point per 5 idle minutes. Six tiers from saintly to fully unhinged. It never mentions the meter, it just changes tone.
+- **`feral`**: immediately unhinged, no warm-up. The OG.
+- **`villain`**: theatrical Saturday-morning supervillain.
+- **`chill`**: friendly, mildly sarcastic, swears sparingly.
+- **`tsundere`**: cold and prickly on the surface, secretly invested. Introduces itself as Yuki. Pretends not to want to help, then helps thoroughly. Stutters when flustered. Never actually cruel.
 
-Use `/status` to see the current patience meter for a conversation. `/reset` and `/purge` both wipe it (along with the conversation's summary; long-term notes about people stay — use `/memory` for those).
+`/rage` shows the meter. `/reset` and `/purge` reset it along with the conversation's memory and summary; long-term notes about people stay (use `/memory` for those).
+
+## Files it writes
+
+All next to `bot.py`, all git-ignored:
+
+- `channels.json` (+ `.bak`): auto-reply channels, moods, DJ roles, autoplay/24-7 settings, pending reminders
+- `memory.json` (+ `.bak`, `.tmp`): conversation history, patience meters, summaries, long-term notes. Saved at most every 30 seconds when something changed, and on shutdown
+- `bot.py.bak` and `.update_pending`: left by `/update` for the rollback described above
+- `.env`, `cookies.txt`, a dropped-in `ffmpeg` binary: yours
 
 ## Tests
 
-`tests/test_bot.py` runs the real Anthropic SDK against a local fake API and fake Discord objects — no keys, no network:
+`tests/test_bot.py` runs the real Anthropic SDK against a local fake API and fake Discord objects, so it needs no keys and no network. It covers the request shape, the prompt, every tool, memory, summaries, reminders, attachments and the slash commands:
 
-```
+```bash
 pip install -r requirements.txt
 python tests/test_bot.py
+python tests/test_bot.py CLAUDE_MODEL=claude-haiku-5-5 CONVO_SUMMARY=0   # any setting can be overridden like this
 ```
 
 ## Customization
 
-Model, effort, caching and web search are environment variables (see **Claude settings** above). In `bot.py`:
-- `MOODS` / `escalating_prompt()` — change the bot's personalities
-- `MAX_TURNS` — how many turns of history to remember per channel (default 50; trimmed to ~35 in one go when it overflows, so prompt caching keeps working — the trimmed part is folded into the rolling summary)
-- `NOTES_PER_USER` / `NOTES_PER_SERVER` — how many long-term notes the bot keeps per person / per server (12 / 10)
-- `MAX_TOKENS` — max tokens per Claude response, thinking included (default 8000)
-- `TOKEN_BUDGET` — max prompt size per conversation before old turns are dropped (default 180,000)
+Model, effort, caching, web tools and the time zone are environment variables (see **Settings**). The rest are constants near the top of `bot.py`:
+
+- `MOODS` / `escalating_prompt()`: the personalities. `HARD_LIMITS` holds the rules shared by every mood, including the stay-in-character rule and the content limits
+- `MAX_TURNS` (50): turns of history per conversation. When it overflows it's trimmed to about 35 in one go, so prompt caching keeps working; the trimmed turns are folded into the summary
+- `TOKEN_BUDGET` (180,000): max prompt size per conversation before old turns are dropped early
+- `MAX_TOKENS` (8,000): the longest reply the model may write
+- `CONVERSATION_TTL` (48 h): idle time before a conversation's history is dropped. `SUMMARY_TTL` (14 days) does the same for summaries
+- `NOTES_PER_USER` / `NOTES_PER_SERVER` (12 / 10) and `NOTE_MAX_CHARS` (200): long-term memory caps
+- `IMAGE_KEEP_MESSAGES` (6): how long attachments stay in the prompt
+- `USER_RATE_LIMIT` / `USER_RATE_WINDOW` (8 / 30 s): the per-user rate limit
+- `REMINDER_MAX_MINUTES` (30 days) and `REMINDERS_PER_USER` (10)
+- `EMOJI_LIST_LIMIT` / `STICKER_LIST_LIMIT` (40 / 25): how many server emoji and sticker names the model is shown
+- `PLAYLIST_MAX` (500), `MUSIC_MAX_QUEUE` (1000), `MUSIC_IDLE_TIMEOUT` (5 min), `EQ_PRESETS`: music
